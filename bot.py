@@ -269,12 +269,17 @@ async def handle_link(client, message):
 
     # Check token expiry before wasting time
     expired, expiry_str = check_token_expiry(url)
+    print(f"[LINK] Received URL, expired={expired}, expiry={expiry_str}")
+
     if expired:
         await message.reply_text(
             f"Link expired\n\nExpired on: {expiry_str}\n\n"
             "Send a fresh link with a valid token."
         )
         return
+
+    if expiry_str:
+        print(f"[LINK] Token valid until: {expiry_str}")
 
     task_id = f"{message.chat.id}_{message.id}_{int(time.time())}"
     filename = f"video_{message.id}_{int(time.time())}.mp4"
