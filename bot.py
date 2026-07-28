@@ -4,6 +4,7 @@ import asyncio
 import re
 import time
 import subprocess
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from pyrogram import Client, filters
@@ -70,6 +71,27 @@ def is_video_url(url):
     keywords = ["m3u8", "video", "stream", "mp4", "hls", ".ts"]
     lower = url.lower()
     return any(kw in lower for kw in keywords)
+
+
+def check_token_expiry(url):
+    """Check if the edge-cache-token in the URL has expired.
+
+    Returns (is_expired: bool, expiry_ist_str: str or None).
+    If no Expires field is found, returns (False, None) so download proceeds.
+    """
+    match = re.search(r"Expires=(\d+)", url)
+    if not match:
+        return False, None
+
+    expires_ts = int(match.group(1))
+    now_ts = int(time.time())
+    ist = timezone(timedelta(hours=5, minutes=30))
+    expiry_dt = datetime.fromtimestamp(expires_ts, tz=ist)
+    expiry_str = expiry_dt.strftime("%d-%m-%Y %I:%M %p IST")
+
+    if now_ts > expires_ts:
+        return True, expiry_str
+    return False, expiry_str
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +265,15 @@ async def handle_link(client, message):
         return
 
     if not is_video_url(url):
+        return
+
+    # Check token expiry before wasting time
+    expired, expiry_str = check_token_expiry(url)
+    if expired:
+        await message.reply_text(
+            f"Link expired\n\nExpired on: {expiry_str}\n\n"
+            "Send a fresh link with a valid token."
+        )
         return
 
     task_id = f"{message.chat.id}_{message.id}_{int(time.time())}"
