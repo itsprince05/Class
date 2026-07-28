@@ -59,6 +59,84 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from dotenv import load_dotenv
 
+import math
+import random
+from pyrogram.client import Client
+from pyrogram.raw.types import InputFileBig, InputFile
+from pyrogram.raw.functions.upload import SaveBigFilePart, SaveFilePart
+from typing import Union
+
+# ---------------------------------------------------------------------------
+# Monkey Patch Pyrogram Fast Uploader
+# ---------------------------------------------------------------------------
+
+original_save_file = Client.save_file
+
+async def fast_save_file(
+    self: Client,
+    path: str,
+    file_id: int = None,
+    file_part: int = 0,
+    progress: callable = None,
+    progress_args: tuple = ()
+) -> Union[InputFile, InputFileBig]:
+    file_size = os.path.getsize(path)
+    
+    # Use standard uploader for files < 10MB
+    if file_size < 10 * 1024 * 1024:
+        return await original_save_file(self, path, file_id, file_part, progress, progress_args)
+        
+    part_size = 512 * 1024
+    total_parts = math.ceil(file_size / part_size)
+    if file_id is None:
+        file_id = random.getrandbits(63)
+        
+    sem = asyncio.Semaphore(10)  # 10 concurrent chunks for extreme speed
+    uploaded_bytes = 0
+    
+    async def upload_part(part_index):
+        nonlocal uploaded_bytes
+        async with sem:
+            with open(path, "rb") as f:
+                f.seek(part_index * part_size)
+                chunk = f.read(part_size)
+                
+            rpc = SaveBigFilePart(
+                file_id=file_id,
+                file_part=part_index,
+                file_total_parts=total_parts,
+                bytes=chunk
+            )
+            
+            for _ in range(5):  # 5 retries per chunk
+                try:
+                    await self.invoke(rpc)
+                    break
+                except Exception:
+                    await asyncio.sleep(1)
+            else:
+                raise Exception(f"Failed to upload part {part_index}")
+                
+            uploaded_bytes += len(chunk)
+            if progress:
+                if asyncio.iscoroutinefunction(progress):
+                    await progress(uploaded_bytes, file_size, *progress_args)
+                else:
+                    progress(uploaded_bytes, file_size, *progress_args)
+
+    # Launch all chunk upload tasks concurrently
+    tasks = [asyncio.create_task(upload_part(i)) for i in range(total_parts)]
+    await asyncio.gather(*tasks)
+
+    return InputFileBig(
+        id=file_id,
+        parts=total_parts,
+        name=Path(path).name
+    )
+
+# Inject the fast uploader into Pyrogram's Client
+Client.save_file = fast_save_file
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
