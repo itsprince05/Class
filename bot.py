@@ -72,20 +72,25 @@ from typing import Union
 
 original_save_file = Client.save_file
 
-async def fast_save_file(
-    self: Client,
-    path: str,
-    file_id: int = None,
-    file_part: int = 0,
-    progress: callable = None,
-    progress_args: tuple = ()
-) -> Union[InputFile, InputFileBig]:
-    file_size = os.path.getsize(path)
-    
-    # Use standard uploader for files < 10MB
-    if file_size < 10 * 1024 * 1024:
-        return await original_save_file(self, path, file_id, file_part, progress, progress_args)
+async def fast_save_file(self: Client, *args, **kwargs) -> Union[InputFile, InputFileBig]:
+    path = kwargs.get("path")
+    if path is None and len(args) > 0:
+        path = args[0]
         
+    # If path is not a string/file, or file doesn't exist, or file < 10MB -> fallback to original
+    if not path or not isinstance(path, (str, Path)) or not os.path.exists(path):
+        return await original_save_file(self, *args, **kwargs)
+        
+    file_size = os.path.getsize(path)
+    if file_size < 10 * 1024 * 1024:
+        return await original_save_file(self, *args, **kwargs)
+        
+    # Extract other arguments if passed
+    file_id = kwargs.get("file_id")
+    file_part = kwargs.get("file_part", 0)
+    progress = kwargs.get("progress")
+    progress_args = kwargs.get("progress_args", ())
+    
     part_size = 512 * 1024
     total_parts = math.ceil(file_size / part_size)
     if file_id is None:
