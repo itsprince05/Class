@@ -284,6 +284,7 @@ async def _download_video(url, output_path, task_id):
             "yt-dlp",
             "--no-warnings",
             "--no-check-certificates",
+            "-N", "10",
         ]
         for hk, hv in all_headers.items():
             ytdlp_cmd += ["--add-header", f"{hk}: {hv}"]
