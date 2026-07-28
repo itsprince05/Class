@@ -78,10 +78,11 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
     ),
-    "Referer": "https://classx.co.in/",
-    "Origin": "https://classx.co.in",
+    "Referer": "https://appx-play.akamai.net.in/",
+    "Origin": "https://appx-play.akamai.net.in",
+    "x-requested-with": "mark.via.gp"
 }
 
 app = Client(
@@ -98,6 +99,35 @@ app = Client(
 # ---------------------------------------------------------------------------
 
 progress_data = {}
+
+# ---------------------------------------------------------------------------
+# Custom headers (loaded from headers.json, set via /setheaders)
+# ---------------------------------------------------------------------------
+
+import json
+
+HEADERS_FILE = BASE_DIR / "headers.json"
+custom_headers = {}
+
+def _load_custom_headers():
+    global custom_headers
+    if HEADERS_FILE.exists():
+        try:
+            custom_headers = json.loads(HEADERS_FILE.read_text())
+            print(f"[SETUP] Loaded {len(custom_headers)} custom headers")
+        except Exception:
+            custom_headers = {}
+
+def _save_custom_headers():
+    HEADERS_FILE.write_text(json.dumps(custom_headers, indent=2))
+
+def _get_all_headers():
+    """Merge default HEADERS with custom_headers. Custom headers override defaults."""
+    merged = dict(HEADERS)
+    merged.update(custom_headers)
+    return merged
+
+_load_custom_headers()
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -226,14 +256,14 @@ async def _download_video(url, output_path, task_id):
 
     Returns (success: bool, error_msg: str).
     """
-    # Build ffmpeg headers string
-    ffmpeg_headers = "".join(f"{k}: {v}\r\n" for k, v in HEADERS.items())
+    # Merge default + custom headers
+    all_headers = _get_all_headers()
+    ffmpeg_headers = "".join(f"{k}: {v}\r\n" for k, v in all_headers.items())
 
     # File size monitor (shared by both yt-dlp and ffmpeg)
     async def _monitor():
         while task_id in progress_data:
             try:
-                # Check all possible output files (yt-dlp may add extensions)
                 for p in [output_path] + list(DOWNLOAD_DIR.glob(f"{Path(output_path).stem}*")):
                     p = str(p)
                     if os.path.exists(p):
@@ -254,12 +284,10 @@ async def _download_video(url, output_path, task_id):
             "yt-dlp",
             "--no-warnings",
             "--no-check-certificates",
-            "--add-header", f"User-Agent: {HEADERS['User-Agent']}",
-            "--add-header", f"Referer: {HEADERS['Referer']}",
-            "--add-header", f"Origin: {HEADERS['Origin']}",
-            "-o", output_path,
-            url,
         ]
+        for hk, hv in all_headers.items():
+            ytdlp_cmd += ["--add-header", f"{hk}: {hv}"]
+        ytdlp_cmd += ["-o", output_path, url]
 
         print(f"[DOWNLOAD] Trying yt-dlp...")
         process = await asyncio.create_subprocess_exec(
@@ -351,10 +379,81 @@ async def handle_start(client, message):
         "Bot is running.\n\n"
         "Send an m3u8 / HLS video link to download and upload.\n\n"
         "Commands:\n"
-        "/start  - Show this message\n"
-        "/test <url> - Test URL from server with curl\n"
+        "/start - Show this message\n"
+        "/setheaders - Set custom request headers\n"
+        "/headers - Show current headers\n"
+        "/clearheaders - Remove custom headers\n"
+        "/test <url> - Test URL from server\n"
         "/update - Pull from GitHub and restart"
     )
+
+
+# ---------------------------------------------------------------------------
+# /setheaders, /headers, /clearheaders
+# ---------------------------------------------------------------------------
+
+
+@app.on_message(owner_filter & filters.command("setheaders"))
+async def handle_setheaders(client, message):
+    """Set custom headers from message text.
+
+    Usage: /setheaders
+    Header1: value1
+    Header2: value2
+    """
+    global custom_headers
+    lines = message.text.split("\n")[1:]  # Skip the /setheaders line
+    if not lines:
+        await message.reply_text(
+            "Usage:\n\n/setheaders\n"
+            "Cookie: your_cookie_here\n"
+            "Authorization: Bearer token\n\n"
+            "Paste headers from 1DM download details (one per line)."
+        )
+        return
+
+    parsed = {}
+    for line in lines:
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        parsed[key.strip()] = value.strip()
+
+    if not parsed:
+        await message.reply_text("No valid headers found. Format: Key: Value")
+        return
+
+    custom_headers = parsed
+    _save_custom_headers()
+
+    header_list = "\n".join(f"{k}: {v[:50]}..." if len(v) > 50 else f"{k}: {v}" for k, v in parsed.items())
+    await message.reply_text(f"Saved {len(parsed)} custom headers:\n\n{header_list}")
+
+
+@app.on_message(owner_filter & filters.command("headers"))
+async def handle_headers(client, message):
+    all_h = _get_all_headers()
+    if not all_h:
+        await message.reply_text("No headers set.")
+        return
+
+    lines = []
+    for k, v in all_h.items():
+        tag = " [custom]" if k in custom_headers else " [default]"
+        display_v = v[:60] + "..." if len(v) > 60 else v
+        lines.append(f"{k}: {display_v}{tag}")
+
+    await message.reply_text("Current headers:\n\n" + "\n".join(lines))
+
+
+@app.on_message(owner_filter & filters.command("clearheaders"))
+async def handle_clearheaders(client, message):
+    global custom_headers
+    custom_headers = {}
+    if HEADERS_FILE.exists():
+        HEADERS_FILE.unlink()
+    await message.reply_text("Custom headers cleared. Only default headers remain.")
 
 
 # ---------------------------------------------------------------------------
@@ -372,16 +471,15 @@ async def handle_test(client, message):
 
     status = await message.reply_text("Testing URL from server...")
 
-    # Test 1: curl with headers, show response body
+    # Test 1: curl with all headers (default + custom), show response body
+    all_h = _get_all_headers()
     curl_cmd = [
         "curl", "-sS",
         "-w", "\n---\nHTTP %{http_code} | Size: %{size_download}B | IP: %{remote_ip}",
-        "-H", f"User-Agent: {HEADERS['User-Agent']}",
-        "-H", f"Referer: {HEADERS['Referer']}",
-        "-H", f"Origin: {HEADERS['Origin']}",
-        "--max-time", "15",
-        url,
     ]
+    for hk, hv in all_h.items():
+        curl_cmd += ["-H", f"{hk}: {hv}"]
+    curl_cmd += ["--max-time", "15", url]
 
     result = await asyncio.create_subprocess_exec(
         *curl_cmd,
@@ -393,6 +491,7 @@ async def handle_test(client, message):
 
     # Test 2: try URL without &bitrate= parameter
     clean_url = re.sub(r"[&?]bitrate=\d+", "", url)
+    custom_tag = f"\nCustom headers: {len(custom_headers)}" if custom_headers else ""
     alt_result = ""
     if clean_url != url:
         curl_cmd2 = [
@@ -412,7 +511,7 @@ async def handle_test(client, message):
         s2, _ = await r2.communicate()
         alt_result = f"\n\nWithout bitrate param:\n{s2.decode(errors='replace').strip()}"
 
-    text = f"Full URL:\n{body_and_stats}{alt_result}"
+    text = f"Full URL:{custom_tag}\n{body_and_stats}{alt_result}"
     if len(text) > 4000:
         text = text[:4000] + "..."
 
@@ -447,7 +546,7 @@ async def handle_update(client, message):
 # ---------------------------------------------------------------------------
 
 
-@app.on_message(owner_filter & filters.text & ~filters.command(["update", "start", "test", "help"]))
+@app.on_message(owner_filter & filters.text & ~filters.command(["update", "start", "test", "setheaders", "headers", "clearheaders", "help"]))
 async def handle_link(client, message):
     url = extract_url(message.text)
     if url is None:
