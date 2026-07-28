@@ -295,8 +295,67 @@ async def handle_start(client, message):
         "Send an m3u8 / HLS video link to download and upload.\n\n"
         "Commands:\n"
         "/start  - Show this message\n"
+        "/test <url> - Test URL from server with curl\n"
         "/update - Pull from GitHub and restart"
     )
+
+
+# ---------------------------------------------------------------------------
+# /test command  (debug URL accessibility from server)
+# ---------------------------------------------------------------------------
+
+
+@app.on_message(owner_filter & filters.command("test"))
+async def handle_test(client, message):
+    """Run curl from the server to debug URL accessibility."""
+    url = extract_url(message.text)
+    if not url:
+        await message.reply_text("Send /test <url>")
+        return
+
+    status = await message.reply_text("Testing URL from server...")
+
+    # Run curl with verbose headers
+    curl_cmd = [
+        "curl", "-sS", "-o", "/dev/null",
+        "-w", "HTTP %{http_code}\nSize: %{size_download} bytes\nTime: %{time_total}s\nIP: %{remote_ip}",
+        "-H", f"User-Agent: {HEADERS['User-Agent']}",
+        "-H", f"Referer: {HEADERS['Referer']}",
+        "-H", f"Origin: {HEADERS['Origin']}",
+        "--max-time", "15",
+        url,
+    ]
+
+    result = await asyncio.create_subprocess_exec(
+        *curl_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await result.communicate()
+    output = stdout.decode(errors="replace").strip()
+    err = stderr.decode(errors="replace").strip()
+
+    # Also test without custom headers
+    curl_cmd_plain = [
+        "curl", "-sS", "-o", "/dev/null",
+        "-w", "HTTP %{http_code}",
+        "--max-time", "15",
+        url,
+    ]
+    result2 = await asyncio.create_subprocess_exec(
+        *curl_cmd_plain,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout2, _ = await result2.communicate()
+    plain_status = stdout2.decode(errors="replace").strip()
+
+    text = f"Curl test results:\n\nWith headers:\n{output}\n"
+    if err:
+        text += f"\nErrors: {err}\n"
+    text += f"\nWithout headers:\n{plain_status}"
+
+    await status.edit_text(text)
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +386,7 @@ async def handle_update(client, message):
 # ---------------------------------------------------------------------------
 
 
-@app.on_message(owner_filter & filters.text & ~filters.command(["update", "start", "help"]))
+@app.on_message(owner_filter & filters.text & ~filters.command(["update", "start", "test", "help"]))
 async def handle_link(client, message):
     url = extract_url(message.text)
     if url is None:
@@ -349,20 +408,6 @@ async def handle_link(client, message):
 
     if expiry_str:
         print(f"[LINK] Token valid until: {expiry_str}")
-
-    # Pre-check URL accessibility
-    print(f"[LINK] Testing URL accessibility...")
-    ok, status_code, err_msg = await asyncio.get_event_loop().run_in_executor(
-        None, check_url_accessible, url
-    )
-    print(f"[LINK] URL check: ok={ok}, status={status_code}, err={err_msg}")
-
-    if not ok:
-        await message.reply_text(
-            f"URL not accessible\n\n{err_msg}\n\n"
-            "Check if the link is correct and try again."
-        )
-        return
 
     task_id = f"{message.chat.id}_{message.id}_{int(time.time())}"
     filename = f"video_{message.id}_{int(time.time())}.mp4"
