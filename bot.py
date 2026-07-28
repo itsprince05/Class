@@ -6,6 +6,8 @@ import time
 import subprocess
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -26,6 +28,15 @@ OWNER_GROUP = int(os.getenv("OWNER_GROUP"))
 BASE_DIR = Path(__file__).parent.resolve()
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://classx.co.in/",
+    "Origin": "https://classx.co.in",
+}
 
 app = Client(
     "bot_session",
@@ -94,6 +105,24 @@ def check_token_expiry(url):
     return False, expiry_str
 
 
+def check_url_accessible(url):
+    """Test if the URL is accessible. Returns (ok, status_code, error_msg)."""
+    try:
+        req = Request(url)
+        for key, val in HEADERS.items():
+            req.add_header(key, val)
+        resp = urlopen(req, timeout=15)
+        resp.read(1024)  # Read a small chunk to verify
+        resp.close()
+        return True, resp.status, None
+    except HTTPError as e:
+        return False, e.code, f"HTTP {e.code}: {e.reason}"
+    except URLError as e:
+        return False, 0, f"URL Error: {e.reason}"
+    except Exception as e:
+        return False, 0, str(e)
+
+
 # ---------------------------------------------------------------------------
 # Owner-group-only filter
 # ---------------------------------------------------------------------------
@@ -142,42 +171,38 @@ async def _progress_loop(status_msg, task_id):
 
 
 # ---------------------------------------------------------------------------
-# FFmpeg HLS downloader
+# Video downloader (yt-dlp primary, ffmpeg fallback)
 # ---------------------------------------------------------------------------
 
 
-async def _ffmpeg_download(url, output_path, task_id):
-    """Download an HLS / m3u8 stream with ffmpeg and return the exit code.
+async def _download_video(url, output_path, task_id):
+    """Download HLS video. Tries yt-dlp first, falls back to ffmpeg.
 
-    A lightweight monitor polls the growing output file every 0.5 s and
-    writes the current size into progress_data so the UI updater can
-    pick it up independently.
+    Returns (success: bool, error_msg: str).
     """
-    headers = (
-        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
-        "Referer: https://classx.co.in/\r\n"
-        "Origin: https://classx.co.in\r\n"
-    )
+    # Build ffmpeg headers string for both yt-dlp and ffmpeg
+    ffmpeg_headers = "".join(f"{k}: {v}\r\n" for k, v in HEADERS.items())
 
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-headers", headers,
-        "-i", url,
-        "-c", "copy",
-        "-bsf:a", "aac_adtstoasc",
-        "-movflags", "+faststart",
-        output_path,
+    # --- Try yt-dlp first ---
+    ytdlp_cmd = [
+        "yt-dlp",
+        "--no-warnings",
+        "--no-check-certificates",
+        "--add-header", f"User-Agent: {HEADERS['User-Agent']}",
+        "--add-header", f"Referer: {HEADERS['Referer']}",
+        "--add-header", f"Origin: {HEADERS['Origin']}",
+        "-o", output_path,
+        url,
     ]
 
+    print(f"[DOWNLOAD] Trying yt-dlp...")
     process = await asyncio.create_subprocess_exec(
-        *cmd,
+        *ytdlp_cmd,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
 
-    # Monitor output file size growth (non-blocking, lightweight)
+    # Monitor file size in background
     async def _monitor():
         while task_id in progress_data:
             try:
@@ -191,7 +216,44 @@ async def _ffmpeg_download(url, output_path, task_id):
 
     _, stderr_bytes = await process.communicate()
 
-    # Stop the monitor
+    if process.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        monitor.cancel()
+        print(f"[DOWNLOAD] yt-dlp succeeded")
+        return True, ""
+
+    ytdlp_err = stderr_bytes.decode(errors="replace").strip()
+    print(f"[DOWNLOAD] yt-dlp failed: {ytdlp_err[-200:]}")
+
+    # --- Fallback to ffmpeg ---
+    print(f"[DOWNLOAD] Falling back to ffmpeg...")
+
+    # Clean up any partial yt-dlp output
+    for f in DOWNLOAD_DIR.glob(f"{Path(output_path).stem}*"):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-y",
+        "-headers", ffmpeg_headers,
+        "-i", url,
+        "-c", "copy",
+        "-bsf:a", "aac_adtstoasc",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    process = await asyncio.create_subprocess_exec(
+        *ffmpeg_cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    _, stderr_bytes = await process.communicate()
+
+    # Stop monitor
     progress_data.pop(task_id, None)
     monitor.cancel()
     try:
@@ -199,7 +261,14 @@ async def _ffmpeg_download(url, output_path, task_id):
     except asyncio.CancelledError:
         pass
 
-    return process.returncode, stderr_bytes.decode(errors="replace")
+    if process.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        print(f"[DOWNLOAD] ffmpeg succeeded")
+        return True, ""
+
+    ffmpeg_err = stderr_bytes.decode(errors="replace").strip()
+    last_lines = "\n".join(ffmpeg_err.split("\n")[-3:])
+    print(f"[DOWNLOAD] ffmpeg also failed: {last_lines}")
+    return False, f"yt-dlp error:\n{ytdlp_err[-300:]}\n\nffmpeg error:\n{last_lines}"
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +350,20 @@ async def handle_link(client, message):
     if expiry_str:
         print(f"[LINK] Token valid until: {expiry_str}")
 
+    # Pre-check URL accessibility
+    print(f"[LINK] Testing URL accessibility...")
+    ok, status_code, err_msg = await asyncio.get_event_loop().run_in_executor(
+        None, check_url_accessible, url
+    )
+    print(f"[LINK] URL check: ok={ok}, status={status_code}, err={err_msg}")
+
+    if not ok:
+        await message.reply_text(
+            f"URL not accessible\n\n{err_msg}\n\n"
+            "Check if the link is correct and try again."
+        )
+        return
+
     task_id = f"{message.chat.id}_{message.id}_{int(time.time())}"
     filename = f"video_{message.id}_{int(time.time())}.mp4"
     output_path = str(DOWNLOAD_DIR / filename)
@@ -298,14 +381,14 @@ async def handle_link(client, message):
     updater = asyncio.create_task(_progress_loop(status_msg, task_id))
 
     try:
-        return_code, stderr = await _ffmpeg_download(url, output_path, task_id)
+        success, error_text = await _download_video(url, output_path, task_id)
 
-        if return_code != 0 or not os.path.exists(output_path):
+        if not success:
             updater.cancel()
-            error_lines = stderr.strip().split("\n")[-3:]
-            await status_msg.edit_text(
-                "Download failed\n\n" + "\n".join(error_lines)
-            )
+            # Truncate error to fit Telegram message limit
+            if len(error_text) > 3500:
+                error_text = error_text[:3500] + "..."
+            await status_msg.edit_text(f"Download failed\n\n{error_text}")
             return
 
         file_size = os.path.getsize(output_path)
