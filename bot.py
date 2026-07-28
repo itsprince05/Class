@@ -96,7 +96,7 @@ async def fast_save_file(self: Client, *args, **kwargs) -> Union[InputFile, Inpu
     if file_id is None:
         file_id = random.getrandbits(63)
         
-    sem = asyncio.Semaphore(10)  # 10 concurrent chunks for extreme speed
+    sem = asyncio.Semaphore(30)  # Increased to 30 concurrent chunks
     uploaded_bytes = 0
     
     async def upload_part(part_index):
