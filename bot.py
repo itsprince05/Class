@@ -236,11 +236,15 @@ def extract_url(text):
     return match.group(0) if match else None
 
 
-def is_video_url(url):
-    """Check whether the URL looks like a video / HLS stream link."""
-    keywords = ["m3u8", "video", "stream", "mp4", "hls", ".ts"]
+def is_supported_url(url):
+    """Check whether the URL looks like a supported video or document link."""
+    keywords = ["m3u8", "video", "stream", "mp4", "hls", ".ts", ".pdf"]
     lower = url.lower()
     return any(kw in lower for kw in keywords)
+
+
+def is_pdf_url(url):
+    return ".pdf" in url.lower()
 
 
 def check_token_expiry(url):
@@ -327,6 +331,36 @@ async def _progress_loop(status_msg, task_id):
                 pass
 
         await asyncio.sleep(3)
+
+
+# ---------------------------------------------------------------------------
+# Direct Downloader (For PDFs and standard files)
+# ---------------------------------------------------------------------------
+
+async def _download_direct(url, output_path, task_id):
+    """Download a simple file natively without yt-dlp."""
+    all_headers = _get_all_headers()
+    
+    def do_download():
+        req = Request(url)
+        for k, v in all_headers.items():
+            req.add_header(k, v)
+            
+        try:
+            with urlopen(req, timeout=30) as response, open(output_path, 'wb') as out_file:
+                while True:
+                    if task_id not in progress_data:
+                        return False, "Cancelled"
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    out_file.write(chunk)
+                    progress_data[task_id]["current"] = os.path.getsize(output_path)
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+            
+    return await asyncio.to_thread(do_download)
 
 
 # ---------------------------------------------------------------------------
@@ -636,8 +670,10 @@ async def handle_link(client, message):
     if url is None:
         return
 
-    if not is_video_url(url):
+    if not is_supported_url(url):
         return
+
+    is_pdf = is_pdf_url(url)
 
     # Check token expiry before wasting time
     expired, expiry_str = check_token_expiry(url)
@@ -654,7 +690,10 @@ async def handle_link(client, message):
         print(f"[LINK] Token valid until: {expiry_str}")
 
     task_id = f"{message.chat.id}_{message.id}_{int(time.time())}"
-    filename = f"video_{message.id}_{int(time.time())}.mp4"
+    if is_pdf:
+        filename = f"document_{message.id}_{int(time.time())}.pdf"
+    else:
+        filename = f"video_{message.id}_{int(time.time())}.mp4"
     output_path = str(DOWNLOAD_DIR / filename)
 
     # -- Download phase ----------------------------------------------------
@@ -670,7 +709,10 @@ async def handle_link(client, message):
     updater = asyncio.create_task(_progress_loop(status_msg, task_id))
 
     try:
-        success, error_text = await _download_video(url, output_path, task_id)
+        if is_pdf:
+            success, error_text = await _download_direct(url, output_path, task_id)
+        else:
+            success, error_text = await _download_video(url, output_path, task_id)
 
         if not success:
             updater.cancel()
@@ -697,14 +739,23 @@ async def handle_link(client, message):
 
         # The updater task is still running; it will now pick up the new phase.
 
-        await client.send_video(
-            chat_id=message.chat.id,
-            video=output_path,
-            file_name=filename,
-            supports_streaming=True,
-            progress=_upload_progress,
-            progress_args=(task_id,),
-        )
+        if is_pdf:
+            await client.send_document(
+                chat_id=message.chat.id,
+                document=output_path,
+                file_name=filename,
+                progress=_upload_progress,
+                progress_args=(task_id,),
+            )
+        else:
+            await client.send_video(
+                chat_id=message.chat.id,
+                video=output_path,
+                file_name=filename,
+                supports_streaming=True,
+                progress=_upload_progress,
+                progress_args=(task_id,),
+            )
 
         # -- Done ----------------------------------------------------------
 
