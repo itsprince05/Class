@@ -96,7 +96,7 @@ async def fast_save_file(self: Client, *args, **kwargs) -> Union[InputFile, Inpu
     if file_id is None:
         file_id = random.getrandbits(63)
         
-    sem = asyncio.Semaphore(100)  # Pushing Pyrogram to its absolute limit
+    sem = asyncio.Semaphore(50)  # Parallel chunks
     uploaded_bytes = 0
     
     async def upload_part(part_index):
@@ -367,7 +367,7 @@ async def _download_video(url, output_path, task_id):
             "yt-dlp",
             "--no-warnings",
             "--no-check-certificates",
-            "-N", "10",
+            "-N", "50",
         ]
         for hk, hv in all_headers.items():
             ytdlp_cmd += ["--add-header", f"{hk}: {hv}"]
