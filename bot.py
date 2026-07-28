@@ -1,9 +1,55 @@
 import os
 import sys
+import subprocess
+import shutil
+
+# ---------------------------------------------------------------------------
+# Auto-install missing dependencies
+# ---------------------------------------------------------------------------
+
+def _ensure_deps():
+    """Install missing Python packages and check CLI tools at startup."""
+    packages = {
+        "pyrogram": "pyrogram",
+        "tgcrypto": "tgcrypto",
+        "dotenv": "python-dotenv",
+        "yt_dlp": "yt-dlp",
+    }
+    missing = []
+    for import_name, pip_name in packages.items():
+        try:
+            __import__(import_name)
+        except ImportError:
+            missing.append(pip_name)
+
+    if missing:
+        print(f"[SETUP] Installing: {', '.join(missing)}")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet"] + missing
+        )
+        print(f"[SETUP] Installed successfully")
+
+    # Check CLI tools
+    if not shutil.which("ffmpeg"):
+        print("[SETUP] WARNING: ffmpeg not found in PATH. Install it:")
+        print("  Ubuntu/Debian: sudo apt install ffmpeg")
+        print("  CentOS/RHEL:   sudo yum install ffmpeg")
+
+    if not shutil.which("yt-dlp"):
+        print("[SETUP] Installing yt-dlp via pip...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", "yt-dlp"]
+        )
+
+_ensure_deps()
+
+# ---------------------------------------------------------------------------
+# Imports (safe to import now, deps are installed)
+# ---------------------------------------------------------------------------
+
 import asyncio
 import re
 import time
-import subprocess
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -180,49 +226,60 @@ async def _download_video(url, output_path, task_id):
 
     Returns (success: bool, error_msg: str).
     """
-    # Build ffmpeg headers string for both yt-dlp and ffmpeg
+    # Build ffmpeg headers string
     ffmpeg_headers = "".join(f"{k}: {v}\r\n" for k, v in HEADERS.items())
 
-    # --- Try yt-dlp first ---
-    ytdlp_cmd = [
-        "yt-dlp",
-        "--no-warnings",
-        "--no-check-certificates",
-        "--add-header", f"User-Agent: {HEADERS['User-Agent']}",
-        "--add-header", f"Referer: {HEADERS['Referer']}",
-        "--add-header", f"Origin: {HEADERS['Origin']}",
-        "-o", output_path,
-        url,
-    ]
-
-    print(f"[DOWNLOAD] Trying yt-dlp...")
-    process = await asyncio.create_subprocess_exec(
-        *ytdlp_cmd,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    # Monitor file size in background
+    # File size monitor (shared by both yt-dlp and ffmpeg)
     async def _monitor():
         while task_id in progress_data:
             try:
-                if os.path.exists(output_path):
-                    progress_data[task_id]["current"] = os.path.getsize(output_path)
+                # Check all possible output files (yt-dlp may add extensions)
+                for p in [output_path] + list(DOWNLOAD_DIR.glob(f"{Path(output_path).stem}*")):
+                    p = str(p)
+                    if os.path.exists(p):
+                        size = os.path.getsize(p)
+                        if size > 0 and task_id in progress_data:
+                            progress_data[task_id]["current"] = size
+                            break
             except OSError:
                 pass
             await asyncio.sleep(0.5)
 
     monitor = asyncio.create_task(_monitor())
 
-    _, stderr_bytes = await process.communicate()
+    # --- Try yt-dlp first ---
+    ytdlp_err = "yt-dlp not installed"
+    try:
+        ytdlp_cmd = [
+            "yt-dlp",
+            "--no-warnings",
+            "--no-check-certificates",
+            "--add-header", f"User-Agent: {HEADERS['User-Agent']}",
+            "--add-header", f"Referer: {HEADERS['Referer']}",
+            "--add-header", f"Origin: {HEADERS['Origin']}",
+            "-o", output_path,
+            url,
+        ]
 
-    if process.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-        monitor.cancel()
-        print(f"[DOWNLOAD] yt-dlp succeeded")
-        return True, ""
+        print(f"[DOWNLOAD] Trying yt-dlp...")
+        process = await asyncio.create_subprocess_exec(
+            *ytdlp_cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
 
-    ytdlp_err = stderr_bytes.decode(errors="replace").strip()
-    print(f"[DOWNLOAD] yt-dlp failed: {ytdlp_err[-200:]}")
+        _, stderr_bytes = await process.communicate()
+
+        if process.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            monitor.cancel()
+            print(f"[DOWNLOAD] yt-dlp succeeded")
+            return True, ""
+
+        ytdlp_err = stderr_bytes.decode(errors="replace").strip()
+        print(f"[DOWNLOAD] yt-dlp failed: {ytdlp_err[-200:]}")
+
+    except FileNotFoundError:
+        print(f"[DOWNLOAD] yt-dlp not installed, skipping")
 
     # --- Fallback to ffmpeg ---
     print(f"[DOWNLOAD] Falling back to ffmpeg...")
@@ -268,7 +325,7 @@ async def _download_video(url, output_path, task_id):
     ffmpeg_err = stderr_bytes.decode(errors="replace").strip()
     last_lines = "\n".join(ffmpeg_err.split("\n")[-3:])
     print(f"[DOWNLOAD] ffmpeg also failed: {last_lines}")
-    return False, f"yt-dlp error:\n{ytdlp_err[-300:]}\n\nffmpeg error:\n{last_lines}"
+    return False, f"yt-dlp: {ytdlp_err[-300:]}\n\nffmpeg: {last_lines}"
 
 
 # ---------------------------------------------------------------------------
@@ -315,10 +372,10 @@ async def handle_test(client, message):
 
     status = await message.reply_text("Testing URL from server...")
 
-    # Run curl with verbose headers
+    # Test 1: curl with headers, show response body
     curl_cmd = [
-        "curl", "-sS", "-o", "/dev/null",
-        "-w", "HTTP %{http_code}\nSize: %{size_download} bytes\nTime: %{time_total}s\nIP: %{remote_ip}",
+        "curl", "-sS",
+        "-w", "\n---\nHTTP %{http_code} | Size: %{size_download}B | IP: %{remote_ip}",
         "-H", f"User-Agent: {HEADERS['User-Agent']}",
         "-H", f"Referer: {HEADERS['Referer']}",
         "-H", f"Origin: {HEADERS['Origin']}",
@@ -332,28 +389,32 @@ async def handle_test(client, message):
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await result.communicate()
-    output = stdout.decode(errors="replace").strip()
-    err = stderr.decode(errors="replace").strip()
+    body_and_stats = stdout.decode(errors="replace").strip()
 
-    # Also test without custom headers
-    curl_cmd_plain = [
-        "curl", "-sS", "-o", "/dev/null",
-        "-w", "HTTP %{http_code}",
-        "--max-time", "15",
-        url,
-    ]
-    result2 = await asyncio.create_subprocess_exec(
-        *curl_cmd_plain,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout2, _ = await result2.communicate()
-    plain_status = stdout2.decode(errors="replace").strip()
+    # Test 2: try URL without &bitrate= parameter
+    clean_url = re.sub(r"[&?]bitrate=\d+", "", url)
+    alt_result = ""
+    if clean_url != url:
+        curl_cmd2 = [
+            "curl", "-sS",
+            "-w", "\n---\nHTTP %{http_code} | Size: %{size_download}B",
+            "-H", f"User-Agent: {HEADERS['User-Agent']}",
+            "-H", f"Referer: {HEADERS['Referer']}",
+            "-H", f"Origin: {HEADERS['Origin']}",
+            "--max-time", "15",
+            clean_url,
+        ]
+        r2 = await asyncio.create_subprocess_exec(
+            *curl_cmd2,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        s2, _ = await r2.communicate()
+        alt_result = f"\n\nWithout bitrate param:\n{s2.decode(errors='replace').strip()}"
 
-    text = f"Curl test results:\n\nWith headers:\n{output}\n"
-    if err:
-        text += f"\nErrors: {err}\n"
-    text += f"\nWithout headers:\n{plain_status}"
+    text = f"Full URL:\n{body_and_stats}{alt_result}"
+    if len(text) > 4000:
+        text = text[:4000] + "..."
 
     await status.edit_text(text)
 
