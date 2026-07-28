@@ -131,9 +131,17 @@ async def _ffmpeg_download(url, output_path, task_id):
     writes the current size into progress_data so the UI updater can
     pick it up independently.
     """
+    headers = (
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
+        "Referer: https://classx.co.in/\r\n"
+        "Origin: https://classx.co.in\r\n"
+    )
+
     cmd = [
         "ffmpeg",
         "-y",
+        "-headers", headers,
         "-i", url,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
@@ -182,6 +190,22 @@ def _upload_progress(current, total, task_id):
     if task_id in progress_data:
         progress_data[task_id]["current"] = current
         progress_data[task_id]["total"] = total
+
+
+# ---------------------------------------------------------------------------
+# /start command
+# ---------------------------------------------------------------------------
+
+
+@app.on_message(owner_filter & filters.command("start"))
+async def handle_start(client, message):
+    await message.reply_text(
+        "Bot is running.\n\n"
+        "Send an m3u8 / HLS video link to download and upload.\n\n"
+        "Commands:\n"
+        "/start  - Show this message\n"
+        "/update - Pull from GitHub and restart"
+    )
 
 
 # ---------------------------------------------------------------------------
