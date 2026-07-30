@@ -287,6 +287,13 @@ def _decrypt_classx(encrypted_str, key_str=None):
             hashlib.sha256(raw_key_string.encode('utf-8')).digest(), # 32 bytes -> AES-256
         ]
 
+        # Add common global keys
+        for global_str in [b"appxapi", b"0123456789abcdef", b"fedcba9876543210", b"ytsejt73it7id73t"]:
+            key_candidates.append(hashlib.md5(global_str).digest())
+            key_candidates.append((global_str + b'\0'*16)[:16])
+            if len(global_str) in [16, 24, 32]:
+                key_candidates.append(global_str)
+
         last_err = ""
         for idx, key in enumerate(key_candidates):
             for mode in [AES.MODE_CBC, AES.MODE_ECB]:
