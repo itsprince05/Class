@@ -203,6 +203,8 @@ app = Client(
 # ---------------------------------------------------------------------------
 
 progress_data = {}
+cancelled_tasks = set()
+active_processes = {}
 
 # ---------------------------------------------------------------------------
 # Custom headers (loaded from headers.json, set via /setheaders)
