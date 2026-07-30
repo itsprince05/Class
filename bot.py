@@ -258,26 +258,33 @@ def _decrypt_classx(encrypted_str, key_str=None):
 
     Format: <base64_ciphertext>:<base64_iv>
     Key format: <base64_key>:<base64_iv> (IV in key is ignored, we use data IV)
+    Returns: (decrypted_string, error_message)
     """
     try:
         parts = encrypted_str.split(":")
         if len(parts) < 2:
-            return None
-        ciphertext = base64.b64decode(parts[0])
-        iv = base64.b64decode(parts[1])
+            return None, "Invalid format (no colon)"
+        
+        # Sometimes base64 strings from JSON need padding fixed
+        def fix_b64(s):
+            return s + "=" * (-len(s) % 4)
+
+        ciphertext = base64.b64decode(fix_b64(parts[0]))
+        iv = base64.b64decode(fix_b64(parts[1]))
 
         if key_str:
             key_parts = key_str.split(":")
-            key = base64.b64decode(key_parts[0])
+            key = base64.b64decode(fix_b64(key_parts[0]))
         else:
-            return None
+            return None, "No key provided"
 
         cipher = AES.new(key, AES.MODE_CBC, iv)
         decrypted = unpad(cipher.decrypt(ciphertext), AES.block_size)
-        return decrypted.decode("utf-8")
+        return decrypted.decode("utf-8"), None
     except Exception as e:
-        print(f"[DECRYPT] Error: {e}")
-        return None
+        import traceback
+        err_str = traceback.format_exc().strip().split('\n')[-1]
+        return None, err_str
 
 # ---------------------------------------------------------------------------
 # ClassX API helpers
@@ -339,21 +346,23 @@ def _resolve_video_url(detail_data, quality="720p"):
         if link.get("quality") == quality:
             key = link.get("key", "")
             logs.append(f"Trying to decrypt {quality} video link...")
-            decrypted = _decrypt_classx(link.get("path", ""), key)
+            decrypted, err = _decrypt_classx(link.get("path", ""), key)
             if decrypted:
                 logs.append(f"Success! URL: {decrypted[:60]}...")
                 return decrypted, "video", "\n".join(logs)
             else:
-                logs.append(f"Failed to decrypt {quality} video link.")
+                logs.append(f"Failed to decrypt {quality} video link. Error: {err}")
 
     # Fallback: try any available quality
     for link in enc_links:
         key = link.get("key", "")
         logs.append(f"Fallback: Trying to decrypt {link.get('quality')} video link...")
-        decrypted = _decrypt_classx(link.get("path", ""), key)
+        decrypted, err = _decrypt_classx(link.get("path", ""), key)
         if decrypted:
             logs.append(f"Success! URL: {decrypted[:60]}...")
             return decrypted, "video", "\n".join(logs)
+        else:
+            logs.append(f"Fallback Failed. Error: {err}")
 
     # Try download_links
     dl_links = detail_data.get("download_links", [])
@@ -389,12 +398,12 @@ def _resolve_pdf_urls(item_data):
             pdfs.append(link)
         elif ":" in link:
             logs.append(f"Trying to decrypt {field}...")
-            decrypted = _decrypt_classx(link, pdf_key)
+            decrypted, err = _decrypt_classx(link, pdf_key)
             if decrypted:
                 logs.append(f"Success! URL: {decrypted[:60]}...")
                 pdfs.append(decrypted)
             else:
-                logs.append(f"Failed to decrypt {field}.")
+                logs.append(f"Failed to decrypt {field}. Error: {err}")
     return pdfs, "\n".join(logs)
 
 # ---------------------------------------------------------------------------
