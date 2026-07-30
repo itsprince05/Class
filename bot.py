@@ -229,10 +229,10 @@ _load_custom_headers()
 
 API_CONFIG_FILE = BASE_DIR / "api_config.json"
 api_config = {
-    "authorization": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpZCI6IjE1NDM0NiIsInRpbWVzdGFtcCI6MTc4NTIxOTMzNiwiaXZfdmVyIjo1LCJzZXNzaW9uIjoiZXlKMGVYQWlPaUpLVjFRaUxDSmhiR2NpT2lKSVV6STFOaUo5LmV5SnBaQ0k2SWpFMU5ETTBOaUlzSW1WdFlXbHNJam9pYVhSemNISnBibU5sTURWQVoyMWhhV3d1WTI5dElpd2libUZ0WlNJNklsQnlhVzVqWlNJc0luUmxibUZ1ZEZSNWNHVWlPaUoxYzJWeUlpd2lkR1Z1WVc1MFRtRnRaU0k2SW5sdlpHaGhZWEJ3WDJSaUlpd2lkR1Z1WVc1MFNXUWlPaUlpTENKa2FYTndiM05oWW14bElqcG1ZV3h6WlgwLmtaUFdWZm12N1VNR3Z5OHl0ZVlBdEpldGJ5NGN0eVQxTVM0aFVxSndoTHMifQ.9ahIDbY9ba-NY3hrt1dt3oXNNcYelS6Wo4Iq2iVCWvA",
-    "user-id": "154346",
-    "x-device-id": "20f953f4c295fe94",
-    "course-id": "130",
+    "authorization": os.getenv("CLASSX_AUTH", ""),
+    "user-id": os.getenv("CLASSX_USER_ID", ""),
+    "x-device-id": os.getenv("CLASSX_DEVICE_ID", "20f953f4c295fe94"),
+    "course-id": os.getenv("CLASSX_COURSE_ID", "130"),
 }
 
 def _load_api_config():
