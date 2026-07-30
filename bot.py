@@ -61,6 +61,7 @@ from urllib.error import HTTPError, URLError
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from pyrogram.errors import FloodWait
 from dotenv import load_dotenv
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
@@ -102,7 +103,7 @@ async def fast_save_file(self: Client, *args, **kwargs) -> Union[InputFile, Inpu
     if file_id is None:
         file_id = random.getrandbits(63)
         
-    sem = asyncio.Semaphore(50)  # Parallel chunks
+    sem = asyncio.Semaphore(10)  # Reduced from 50 to prevent Telegram rate limits
     uploaded_bytes = 0
     
     async def upload_part(part_index):
@@ -119,12 +120,14 @@ async def fast_save_file(self: Client, *args, **kwargs) -> Union[InputFile, Inpu
                 bytes=chunk
             )
             
-            for _ in range(5):  # 5 retries per chunk
+            for attempt in range(10):  # 10 retries per chunk
                 try:
                     await self.invoke(rpc)
                     break
-                except Exception:
-                    await asyncio.sleep(1)
+                except FloodWait as e:
+                    await asyncio.sleep(e.value + 1)
+                except Exception as e:
+                    await asyncio.sleep(3)
             else:
                 raise Exception(f"Failed to upload part {part_index}")
                 
