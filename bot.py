@@ -874,9 +874,10 @@ async def handle_cancel_task(client, callback_query: CallbackQuery):
         except OSError:
             pass
             
-    await callback_query.answer("Cancelling task...", show_alert=True)
+    await callback_query.answer()
     try:
-        await callback_query.message.edit_text(f"{callback_query.message.text}\n\nTask Cancelled ❌")
+        msg_text = callback_query.message.text or "Task"
+        await callback_query.message.edit_text(f"{msg_text}\n\nTask Cancelled")
     except Exception:
         pass
 
@@ -1155,31 +1156,6 @@ async def handle_link(client, message):
                 os.remove(output_path)
         except OSError:
             pass
-
-
-# ---------------------------------------------------------------------------
-# Callback Query Handler (for cancellation)
-# ---------------------------------------------------------------------------
-
-@app.on_callback_query(filters.regex(r"^cancel_"))
-async def handle_cancel_task(client, callback_query: CallbackQuery):
-    task_id = callback_query.data.split("cancel_", 1)[1]
-    cancelled_tasks.add(task_id)
-    
-    # Kill subprocess if any
-    proc = active_processes.get(task_id)
-    if proc:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-            
-    await callback_query.answer("Cancelling task...", show_alert=False)
-    try:
-        msg_text = callback_query.message.text or "Task"
-        await callback_query.message.edit_text(f"{msg_text}\n\nTask Cancelled")
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------------------
