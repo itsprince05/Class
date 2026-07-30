@@ -53,6 +53,7 @@ import re
 import time
 import base64
 import gzip
+import hashlib
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -274,20 +275,35 @@ def _decrypt_classx(encrypted_str, key_str=None):
 
         if key_str:
             key_parts = key_str.split(":")
-            key = base64.b64decode(fix_b64(key_parts[0]))
+            raw_key_string = key_parts[0]
         else:
             return None, "No key provided"
 
-        cipher = AES.new(key, AES.MODE_CBC, iv)
-        raw_decrypted = cipher.decrypt(ciphertext)
-        
-        try:
-            decrypted = unpad(raw_decrypted, AES.block_size)
-            return decrypted.decode("utf-8"), None
-        except ValueError as e:
-            # If padding is wrong, let's see what the raw decrypted bytes look like
-            raw_str = repr(raw_decrypted[:60])
-            return None, f"Padding Error. Raw start: {raw_str}"
+        # We will try multiple ways to derive the key, because we don't know exactly what AppX uses
+        key_candidates = [
+            base64.b64decode(fix_b64(raw_key_string)), # 16 bytes -> AES-128
+            raw_key_string.encode('utf-8'), # 24 bytes -> AES-192
+            hashlib.md5(raw_key_string.encode('utf-8')).digest(), # 16 bytes -> AES-128
+            hashlib.sha256(raw_key_string.encode('utf-8')).digest(), # 32 bytes -> AES-256
+        ]
+
+        last_err = ""
+        for idx, key in enumerate(key_candidates):
+            try:
+                cipher = AES.new(key, AES.MODE_CBC, iv)
+                decrypted = unpad(cipher.decrypt(ciphertext), AES.block_size)
+                dec_str = decrypted.decode("utf-8")
+                # ClassX URLs should start with http
+                if dec_str.startswith("http"):
+                    return dec_str, None
+            except Exception as e:
+                last_err = str(e)
+                continue
+
+        # If all failed, let's return the raw bytes of the first method (standard base64) for debugging
+        cipher = AES.new(key_candidates[0], AES.MODE_CBC, iv)
+        raw_dec = cipher.decrypt(ciphertext)
+        return None, f"All keys failed. Last error: {last_err}. Raw start: {repr(raw_dec[:60])}"
 
     except Exception as e:
         import traceback
@@ -397,8 +413,8 @@ def _resolve_pdf_urls(item_data):
     logs = []
     pdf_key = item_data.get("pdf_encryption_key", "")
     
-    # ClassX can have multiple PDFs (pdf_link, pdf_link2, pdf_link3, etc.)
-    pdf_fields = ["pdf_link"] + [f"pdf_link{i}" for i in range(2, 11)]
+    # ClassX can have multiple PDFs (study_material_link, pdf_link, pdf_link2, pdf_link3, etc.)
+    pdf_fields = ["study_material_link", "pdf_link"] + [f"pdf_link{i}" for i in range(2, 11)]
     
     for field in pdf_fields:
         link = item_data.get(field, "")
@@ -827,7 +843,7 @@ async def handle_batch(client, message):
     video_count = sum(1 for i in items if i.get("material_type") == "VIDEO")
     
     # Count total PDFs accurately
-    pdf_fields = ["pdf_link"] + [f"pdf_link{i}" for i in range(2, 11)]
+    pdf_fields = ["study_material_link", "pdf_link"] + [f"pdf_link{i}" for i in range(2, 11)]
     pdf_count = 0
     for i in items:
         for field in pdf_fields:
