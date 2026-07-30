@@ -14,6 +14,7 @@ def _ensure_deps():
         "tgcrypto": "tgcrypto",
         "dotenv": "python-dotenv",
         "yt_dlp": "yt-dlp",
+        "Crypto": "pycryptodome",
     }
     missing = []
     for import_name, pip_name in packages.items():
@@ -50,6 +51,9 @@ _ensure_deps()
 import asyncio
 import re
 import time
+import base64
+import gzip
+from io import BytesIO
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -58,6 +62,8 @@ from urllib.error import HTTPError, URLError
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from dotenv import load_dotenv
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
 
 import math
 import random
@@ -156,6 +162,11 @@ OWNER_GROUP = int(os.getenv("OWNER_GROUP"))
 
 BASE_DIR = Path(__file__).parent.resolve()
 DOWNLOAD_DIR = BASE_DIR / "downloads"
+
+# Clean up stale downloads from previous runs (e.g., if interrupted by /update)
+import shutil
+if DOWNLOAD_DIR.exists():
+    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 HEADERS = {
@@ -213,6 +224,161 @@ def _get_all_headers():
 _load_custom_headers()
 
 # ---------------------------------------------------------------------------
+# API config (loaded from api_config.json, set via /setapi)
+# ---------------------------------------------------------------------------
+
+API_CONFIG_FILE = BASE_DIR / "api_config.json"
+api_config = {
+    "authorization": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpZCI6IjE1NDM0NiIsInRpbWVzdGFtcCI6MTc4NTIxOTMzNiwiaXZfdmVyIjo1LCJzZXNzaW9uIjoiZXlKMGVYQWlPaUpLVjFRaUxDSmhiR2NpT2lKSVV6STFOaUo5LmV5SnBaQ0k2SWpFMU5ETTBOaUlzSW1WdFlXbHNJam9pYVhSemNISnBibU5sTURWQVoyMWhhV3d1WTI5dElpd2libUZ0WlNJNklsQnlhVzVqWlNJc0luUmxibUZ1ZEZSNWNHVWlPaUoxYzJWeUlpd2lkR1Z1WVc1MFRtRnRaU0k2SW5sdlpHaGhZWEJ3WDJSaUlpd2lkR1Z1WVc1MFNXUWlPaUlpTENKa2FYTndiM05oWW14bElqcG1ZV3h6WlgwLmtaUFdWZm12N1VNR3Z5OHl0ZVlBdEpldGJ5NGN0eVQxTVM0aFVxSndoTHMifQ.9ahIDbY9ba-NY3hrt1dt3oXNNcYelS6Wo4Iq2iVCWvA",
+    "user-id": "154346",
+    "x-device-id": "20f953f4c295fe94",
+    "course-id": "130",
+}
+
+def _load_api_config():
+    global api_config
+    if API_CONFIG_FILE.exists():
+        try:
+            api_config = json.loads(API_CONFIG_FILE.read_text())
+            print(f"[SETUP] Loaded API config (user-id: {api_config.get('user-id', 'N/A')})")
+        except Exception:
+            api_config = {}
+
+def _save_api_config():
+    API_CONFIG_FILE.write_text(json.dumps(api_config, indent=2))
+
+_load_api_config()
+
+# ---------------------------------------------------------------------------
+# AES Decryption for ClassX encrypted links
+# ---------------------------------------------------------------------------
+
+def _decrypt_classx(encrypted_str, key_str=None):
+    """Decrypt a ClassX encrypted string.
+
+    Format: <base64_ciphertext>:<base64_iv>
+    Key format: <base64_key>:<base64_iv> (IV in key is ignored, we use data IV)
+    """
+    try:
+        parts = encrypted_str.split(":")
+        if len(parts) < 2:
+            return None
+        ciphertext = base64.b64decode(parts[0])
+        iv = base64.b64decode(parts[1])
+
+        if key_str:
+            key_parts = key_str.split(":")
+            key = base64.b64decode(key_parts[0])
+        else:
+            return None
+
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        decrypted = unpad(cipher.decrypt(ciphertext), AES.block_size)
+        return decrypted.decode("utf-8")
+    except Exception as e:
+        print(f"[DECRYPT] Error: {e}")
+        return None
+
+# ---------------------------------------------------------------------------
+# ClassX API helpers
+# ---------------------------------------------------------------------------
+
+CLASSX_API_BASE = "https://yodhaappapi.classx.co.in"
+
+def _get_api_headers():
+    """Build headers for ClassX API calls."""
+    return {
+        "Host": "yodhaappapi.classx.co.in",
+        "client-service": "Appx",
+        "auth-key": "appxapi",
+        "user-id": api_config.get("user-id", ""),
+        "authorization": api_config.get("authorization", ""),
+        "user-app-category": "",
+        "language": "en",
+        "x-tenant-app-version": "132",
+        "device-type": "ANDROID",
+        "x-device-id": api_config.get("x-device-id", "20f953f4c295fe94"),
+        "accept-encoding": "gzip",
+        "user-agent": "okhttp/5.3.2",
+    }
+
+def _api_get(url):
+    """Make a GET request to ClassX API and return JSON."""
+    headers = _get_api_headers()
+    req = Request(url)
+    for k, v in headers.items():
+        req.add_header(k, v)
+
+    with urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+        # Handle gzip response
+        if resp.headers.get("Content-Encoding") == "gzip":
+            raw = gzip.decompress(raw)
+        return json.loads(raw.decode("utf-8"))
+
+def _get_folder_contents(course_id, parent_id):
+    """Get all items in a folder."""
+    url = (f"{CLASSX_API_BASE}/get/folder_contentsv3"
+           f"?start=0&course_id={course_id}&parent_id={parent_id}")
+    return _api_get(url)
+
+def _get_video_details(course_id, video_id):
+    """Get full video details including encrypted links."""
+    url = (f"{CLASSX_API_BASE}/get/fetchVideoDetailsById"
+           f"?course_id={course_id}&folder_wise_course=1&ytflag=0&video_id={video_id}")
+    return _api_get(url)
+
+def _resolve_video_url(detail_data, quality="720p"):
+    """Decrypt the best available video URL from detail data."""
+    # Try encrypted_links first (HLS streams)
+    enc_links = detail_data.get("encrypted_links", [])
+    for link in enc_links:
+        if link.get("quality") == quality:
+            key = link.get("key", "")
+            decrypted = _decrypt_classx(link.get("path", ""), key)
+            if decrypted:
+                return decrypted, "video"
+
+    # Fallback: try any available quality
+    for link in enc_links:
+        key = link.get("key", "")
+        decrypted = _decrypt_classx(link.get("path", ""), key)
+        if decrypted:
+            return decrypted, "video"
+
+    # Try download_links
+    dl_links = detail_data.get("download_links", [])
+    for link in dl_links:
+        if link.get("quality") == quality:
+            path = link.get("path", "")
+            if path.startswith("http"):
+                return path, "video"
+
+    # Try file_link
+    file_link = detail_data.get("file_link", "")
+    if file_link and file_link.startswith("http"):
+        return file_link, "video"
+
+    return None, None
+
+def _resolve_pdf_urls(item_data):
+    """Decrypt PDF URLs from item data."""
+    pdfs = []
+    pdf_key = item_data.get("pdf_encryption_key", "")
+
+    for field in ["pdf_link", "pdf_link2"]:
+        link = item_data.get(field, "")
+        if not link:
+            continue
+        if link.startswith("http"):
+            pdfs.append(link)
+        elif ":" in link:
+            decrypted = _decrypt_classx(link, pdf_key)
+            if decrypted:
+                pdfs.append(decrypted)
+    return pdfs
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -261,7 +427,7 @@ def check_token_expiry(url):
     now_ts = int(time.time())
     ist = timezone(timedelta(hours=5, minutes=30))
     expiry_dt = datetime.fromtimestamp(expires_ts, tz=ist)
-    expiry_str = expiry_dt.strftime("%d-%m-%Y %I:%M %p IST")
+    expiry_str = expiry_dt.strftime("%I:%M %p %d/%m/%Y")
 
     if now_ts > expires_ts:
         return True, expiry_str
@@ -494,16 +660,300 @@ def _upload_progress(current, total, task_id):
 @app.on_message(owner_filter & filters.command("start"))
 async def handle_start(client, message):
     await message.reply_text(
-        "Bot is running.\n\n"
+        "Bot is running...\n\n"
         "Send an m3u8 / HLS video link to download and upload.\n\n"
         "Commands:\n"
         "/start - Show this message\n"
+        "/batch <parent_id> - Batch download chapter\n"
+        "/setapi - Set ClassX API credentials\n"
+        "/api - Show API config\n"
+        "/clearapi - Remove API credentials\n"
         "/setheaders - Set custom request headers\n"
         "/headers - Show current headers\n"
         "/clearheaders - Remove custom headers\n"
         "/test <url> - Test URL from server\n"
         "/update - Pull from GitHub and restart"
     )
+
+
+# ---------------------------------------------------------------------------
+# /setapi, /api, /clearapi
+# ---------------------------------------------------------------------------
+
+
+@app.on_message(owner_filter & filters.command("setapi"))
+async def handle_setapi(client, message):
+    """Set ClassX API credentials.
+
+    Usage: /setapi
+    authorization: eyJ0eXAi...
+    user-id: 154346
+    x-device-id: 20f953f4c295fe94
+    """
+    global api_config
+    lines = message.text.split("\n")[1:]
+    if not lines:
+        await message.reply_text(
+            "Usage:\n\n/setapi\n"
+            "authorization: eyJ0eXAi...\n"
+            "user-id: 154346\n"
+            "x-device-id: 20f953f4c295fe94"
+        )
+        return
+
+    parsed = {}
+    for line in lines:
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        parsed[key.strip()] = value.strip()
+
+    if not parsed:
+        await message.reply_text("No valid config found...")
+        return
+
+    api_config = parsed
+    _save_api_config()
+
+    display = "\n".join(
+        f"{k}: {v[:40]}..." if len(v) > 40 else f"{k}: {v}"
+        for k, v in parsed.items()
+    )
+    await message.reply_text(f"API config saved...\n\n{display}")
+
+
+@app.on_message(owner_filter & filters.command("api"))
+async def handle_api(client, message):
+    if not api_config:
+        await message.reply_text("API config not set... Use /setapi")
+        return
+
+    display = "\n".join(
+        f"{k}: {v[:50]}..." if len(v) > 50 else f"{k}: {v}"
+        for k, v in api_config.items()
+    )
+    await message.reply_text(f"API Config:\n\n{display}")
+
+
+@app.on_message(owner_filter & filters.command("clearapi"))
+async def handle_clearapi(client, message):
+    global api_config
+    api_config = {}
+    if API_CONFIG_FILE.exists():
+        API_CONFIG_FILE.unlink()
+    await message.reply_text("API config cleared...")
+
+
+# ---------------------------------------------------------------------------
+# /batch command - Auto download entire chapter
+# ---------------------------------------------------------------------------
+
+
+@app.on_message(owner_filter & filters.command("batch"))
+async def handle_batch(client, message):
+    """Batch download all videos and PDFs from a chapter.
+
+    Usage: /batch <parent_id>
+    Or:    /batch <course_id> <parent_id>
+    """
+    if not api_config.get("authorization"):
+        await message.reply_text("API not configured... Use /setapi first")
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply_text("Usage: /batch <parent_id>")
+        return
+
+    if len(parts) >= 3:
+        course_id = parts[1]
+        parent_id = parts[2]
+    else:
+        course_id = api_config.get("course-id", "130")
+        parent_id = parts[1]
+
+    status_msg = await message.reply_text("Fetching chapter contents...")
+
+    # Step 1: Get folder contents
+    try:
+        folder_data = await asyncio.to_thread(_get_folder_contents, course_id, parent_id)
+    except Exception as e:
+        await status_msg.edit_text(f"API error...\n\n{e}")
+        return
+
+    if folder_data.get("status") != 200:
+        await status_msg.edit_text(f"API error...\n\n{folder_data.get('message', 'Unknown')}")
+        return
+
+    items = folder_data.get("data", [])
+    if not items:
+        await status_msg.edit_text("No items found in this chapter...")
+        return
+
+    total = len(items)
+    video_count = sum(1 for i in items if i.get("material_type") == "VIDEO")
+    pdf_items = sum(1 for i in items if i.get("pdf_link") or i.get("pdf_link2"))
+
+    await status_msg.edit_text(
+        f"Found {total} items...\n\n"
+        f"Videos: {video_count}\n"
+        f"Processing..."
+    )
+
+    # Step 2: Process each item
+    success_count = 0
+    fail_count = 0
+
+    for idx, item in enumerate(items, 1):
+        title = item.get("Title", f"Item {idx}")
+        item_id = item.get("id")
+        material_type = item.get("material_type", "")
+
+        try:
+            await status_msg.edit_text(
+                f"Processing {idx}/{total}...\n\n{title}"
+            )
+        except Exception:
+            pass
+
+        # --- Handle VIDEO ---
+        if material_type == "VIDEO":
+            try:
+                detail_resp = await asyncio.to_thread(
+                    _get_video_details, course_id, item_id
+                )
+                detail = detail_resp.get("data", {})
+
+                video_url, _ = _resolve_video_url(detail, quality="720p")
+
+                if not video_url:
+                    print(f"[BATCH] Could not resolve video URL for: {title}")
+                    fail_count += 1
+                    continue
+
+                # Download
+                task_id = f"batch_{item_id}_{int(time.time())}"
+                filename = f"{title}.mp4".replace("/", "-").replace("\\", "-")
+                output_path = str(DOWNLOAD_DIR / filename)
+
+                progress_data[task_id] = {
+                    "phase": f"Downloading...\n{title}",
+                    "current": 0,
+                    "total": 0,
+                }
+
+                updater = asyncio.create_task(_progress_loop(status_msg, task_id))
+
+                if video_url.endswith(".m3u8") or "m3u8" in video_url:
+                    success, err = await _download_video(video_url, output_path, task_id)
+                else:
+                    success, err = await _download_direct(video_url, output_path, task_id)
+
+                if not success or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+                    progress_data.pop(task_id, None)
+                    updater.cancel()
+                    print(f"[BATCH] Download failed for: {title} - {err}")
+                    fail_count += 1
+                    continue
+
+                # Upload
+                file_size = os.path.getsize(output_path)
+                progress_data[task_id] = {
+                    "phase": f"Uploading...\n{title}",
+                    "current": 0,
+                    "total": file_size,
+                }
+
+                await client.send_video(
+                    chat_id=message.chat.id,
+                    video=output_path,
+                    file_name=filename,
+                    caption=title,
+                    supports_streaming=True,
+                    progress=_upload_progress,
+                    progress_args=(task_id,),
+                )
+
+                progress_data.pop(task_id, None)
+                updater.cancel()
+                success_count += 1
+
+            except Exception as e:
+                print(f"[BATCH] Error processing video {title}: {e}")
+                fail_count += 1
+            finally:
+                try:
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                except OSError:
+                    pass
+
+        # --- Handle PDFs ---
+        pdf_urls = _resolve_pdf_urls(item)
+        for pidx, pdf_url in enumerate(pdf_urls):
+            try:
+                pdf_label = f"{title} - PDF{pidx + 1}" if len(pdf_urls) > 1 else f"{title} - PDF"
+                task_id = f"batch_pdf_{item_id}_{pidx}_{int(time.time())}"
+                pdf_filename = f"{pdf_label}.pdf".replace("/", "-").replace("\\", "-")
+                pdf_path = str(DOWNLOAD_DIR / pdf_filename)
+
+                progress_data[task_id] = {
+                    "phase": f"Downloading...\n{pdf_label}",
+                    "current": 0,
+                    "total": 0,
+                }
+
+                updater = asyncio.create_task(_progress_loop(status_msg, task_id))
+                success, err = await _download_direct(pdf_url, pdf_path, task_id)
+
+                if not success or not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
+                    progress_data.pop(task_id, None)
+                    updater.cancel()
+                    print(f"[BATCH] PDF download failed for: {pdf_label} - {err}")
+                    fail_count += 1
+                    continue
+
+                file_size = os.path.getsize(pdf_path)
+                progress_data[task_id] = {
+                    "phase": f"Uploading...\n{pdf_label}",
+                    "current": 0,
+                    "total": file_size,
+                }
+
+                await client.send_document(
+                    chat_id=message.chat.id,
+                    document=pdf_path,
+                    file_name=pdf_filename,
+                    caption=pdf_label,
+                    progress=_upload_progress,
+                    progress_args=(task_id,),
+                )
+
+                progress_data.pop(task_id, None)
+                updater.cancel()
+                success_count += 1
+
+            except Exception as e:
+                print(f"[BATCH] Error processing PDF {pdf_label}: {e}")
+                fail_count += 1
+            finally:
+                try:
+                    if os.path.exists(pdf_path):
+                        os.remove(pdf_path)
+                except OSError:
+                    pass
+
+    # Final summary
+    try:
+        await status_msg.edit_text(
+            f"Batch complete...\n\n"
+            f"Total: {total}\n"
+            f"Done: {success_count}\n"
+            f"Failed: {fail_count}"
+        )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -664,7 +1114,7 @@ async def handle_update(client, message):
 # ---------------------------------------------------------------------------
 
 
-@app.on_message(owner_filter & filters.text & ~filters.command(["update", "start", "test", "setheaders", "headers", "clearheaders", "help"]))
+@app.on_message(owner_filter & filters.text & ~filters.command(["update", "start", "test", "setheaders", "headers", "clearheaders", "setapi", "api", "clearapi", "batch", "help"]))
 async def handle_link(client, message):
     url = extract_url(message.text)
     if url is None:
@@ -681,8 +1131,8 @@ async def handle_link(client, message):
 
     if expired:
         await message.reply_text(
-            f"Link expired\n\nExpired on: {expiry_str}\n\n"
-            "Send a fresh link with a valid token."
+            f"Link Expired...\n\n{expiry_str}\n\n"
+            "Send a fresh link..."
         )
         return
 
@@ -698,10 +1148,10 @@ async def handle_link(client, message):
 
     # -- Download phase ----------------------------------------------------
 
-    status_msg = await message.reply_text("Downloading\n\n0 B")
+    status_msg = await message.reply_text("Downloading...\n\n0 B")
 
     progress_data[task_id] = {
-        "phase": "Downloading",
+        "phase": "Downloading...",
         "current": 0,
         "total": 0,
     }
@@ -719,20 +1169,20 @@ async def handle_link(client, message):
             # Truncate error to fit Telegram message limit
             if len(error_text) > 3500:
                 error_text = error_text[:3500] + "..."
-            await status_msg.edit_text(f"Download failed\n\n{error_text}")
+            await status_msg.edit_text(f"Download failed...\n\n{error_text}")
             return
 
         file_size = os.path.getsize(output_path)
 
         if file_size == 0:
             updater.cancel()
-            await status_msg.edit_text("Download failed: file is empty")
+            await status_msg.edit_text("Download failed: file is empty...")
             return
 
         # -- Upload phase --------------------------------------------------
 
         progress_data[task_id] = {
-            "phase": "Uploading",
+            "phase": "Uploading...",
             "current": 0,
             "total": file_size,
         }
@@ -762,14 +1212,16 @@ async def handle_link(client, message):
         progress_data.pop(task_id, None)
         updater.cancel()
 
-        await status_msg.edit_text(
-            f"Completed\n\nFile: {filename}\nSize: {format_bytes(file_size)}"
-        )
+        # Delete the status message as requested by user
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
     except Exception as exc:
         progress_data.pop(task_id, None)
         updater.cancel()
-        await status_msg.edit_text(f"Error: {exc}")
+        await status_msg.edit_text(f"Error...\n\n{exc}")
 
     finally:
         # Always clean up the local file
