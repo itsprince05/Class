@@ -1,5 +1,6 @@
 .env
 headers.json
+api_config.json
 downloads/
 __pycache__/
 *.session
