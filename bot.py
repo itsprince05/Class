@@ -83,7 +83,7 @@ async def fast_save_file(self: Client, *args, **kwargs) -> Union[InputFile, Inpu
     if path is None and len(args) > 0:
         path = args[0]
         
-    # If path is not a string/file, or file doesn't exist, or file < 10MB -> fallback to original
+    # Fallback to original save_file for small files or if path is missing
     if not path or not isinstance(path, (str, Path)) or not os.path.exists(path):
         return await original_save_file(self, *args, **kwargs)
         
@@ -330,53 +330,72 @@ def _get_video_details(course_id, video_id):
 
 def _resolve_video_url(detail_data, quality="720p"):
     """Decrypt the best available video URL from detail data."""
+    logs = []
     # Try encrypted_links first (HLS streams)
     enc_links = detail_data.get("encrypted_links", [])
+    logs.append(f"Found {len(enc_links)} encrypted video links.")
+    
     for link in enc_links:
         if link.get("quality") == quality:
             key = link.get("key", "")
+            logs.append(f"Trying to decrypt {quality} video link...")
             decrypted = _decrypt_classx(link.get("path", ""), key)
             if decrypted:
-                return decrypted, "video"
+                logs.append(f"Success! URL: {decrypted[:60]}...")
+                return decrypted, "video", "\n".join(logs)
+            else:
+                logs.append(f"Failed to decrypt {quality} video link.")
 
     # Fallback: try any available quality
     for link in enc_links:
         key = link.get("key", "")
+        logs.append(f"Fallback: Trying to decrypt {link.get('quality')} video link...")
         decrypted = _decrypt_classx(link.get("path", ""), key)
         if decrypted:
-            return decrypted, "video"
+            logs.append(f"Success! URL: {decrypted[:60]}...")
+            return decrypted, "video", "\n".join(logs)
 
     # Try download_links
     dl_links = detail_data.get("download_links", [])
+    logs.append(f"Found {len(dl_links)} unencrypted download links.")
     for link in dl_links:
         if link.get("quality") == quality:
             path = link.get("path", "")
             if path.startswith("http"):
-                return path, "video"
+                logs.append(f"Using unencrypted {quality} link.")
+                return path, "video", "\n".join(logs)
 
     # Try file_link
     file_link = detail_data.get("file_link", "")
     if file_link and file_link.startswith("http"):
-        return file_link, "video"
+        logs.append(f"Using direct file_link.")
+        return file_link, "video", "\n".join(logs)
 
-    return None, None
+    logs.append("Could not find or decrypt any video URL.")
+    return None, None, "\n".join(logs)
 
 def _resolve_pdf_urls(item_data):
     """Decrypt PDF URLs from item data."""
     pdfs = []
+    logs = []
     pdf_key = item_data.get("pdf_encryption_key", "")
-
+    
     for field in ["pdf_link", "pdf_link2"]:
         link = item_data.get(field, "")
         if not link:
             continue
         if link.startswith("http"):
+            logs.append(f"Found unencrypted {field}.")
             pdfs.append(link)
         elif ":" in link:
+            logs.append(f"Trying to decrypt {field}...")
             decrypted = _decrypt_classx(link, pdf_key)
             if decrypted:
+                logs.append(f"Success! URL: {decrypted[:60]}...")
                 pdfs.append(decrypted)
-    return pdfs
+            else:
+                logs.append(f"Failed to decrypt {field}.")
+    return pdfs, "\n".join(logs)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -786,13 +805,15 @@ async def handle_batch(client, message):
 
     total = len(items)
     video_count = sum(1 for i in items if i.get("material_type") == "VIDEO")
-    pdf_items = sum(1 for i in items if i.get("pdf_link") or i.get("pdf_link2"))
+    pdf_count = sum(1 for i in items if i.get("pdf_link") or i.get("pdf_link2"))
 
     await status_msg.edit_text(
-        f"Found {total} items...\n\n"
+        f"Found {total} items...\n"
         f"Videos: {video_count}\n"
-        f"Processing..."
+        f"PDFs: {pdf_count}\n\n"
+        f"Processing started..."
     )
+    await asyncio.sleep(2)
 
     # Step 2: Process each item
     success_count = 0
@@ -804,24 +825,32 @@ async def handle_batch(client, message):
         material_type = item.get("material_type", "")
 
         try:
-            await status_msg.edit_text(
-                f"Processing {idx}/{total}...\n\n{title}"
-            )
+            await status_msg.edit_text(f"Processing {idx}/{total}...\n\nTitle: {title}\nType: {material_type}")
         except Exception:
             pass
 
         # --- Handle VIDEO ---
         if material_type == "VIDEO":
             try:
+                try:
+                    await status_msg.edit_text(f"[{idx}/{total}] Fetching video details for: {title}...")
+                except Exception:
+                    pass
+
                 detail_resp = await asyncio.to_thread(
                     _get_video_details, course_id, item_id
                 )
                 detail = detail_resp.get("data", {})
 
-                video_url, _ = _resolve_video_url(detail, quality="720p")
+                video_url, _, v_logs = _resolve_video_url(detail, quality="720p")
+
+                try:
+                    await status_msg.edit_text(f"[{idx}/{total}] {title}\n\nDecryption Logs:\n{v_logs}")
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
 
                 if not video_url:
-                    print(f"[BATCH] Could not resolve video URL for: {title}")
                     fail_count += 1
                     continue
 
@@ -846,8 +875,12 @@ async def handle_batch(client, message):
                 if not success or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
                     progress_data.pop(task_id, None)
                     updater.cancel()
-                    print(f"[BATCH] Download failed for: {title} - {err}")
                     fail_count += 1
+                    try:
+                        await status_msg.edit_text(f"Download failed for {title}:\n{err}")
+                        await asyncio.sleep(3)
+                    except Exception:
+                        pass
                     continue
 
                 # Upload
@@ -873,8 +906,12 @@ async def handle_batch(client, message):
                 success_count += 1
 
             except Exception as e:
-                print(f"[BATCH] Error processing video {title}: {e}")
                 fail_count += 1
+                try:
+                    await status_msg.edit_text(f"Error processing video {title}:\n{e}")
+                    await asyncio.sleep(3)
+                except Exception:
+                    pass
             finally:
                 try:
                     if os.path.exists(output_path):
@@ -883,7 +920,14 @@ async def handle_batch(client, message):
                     pass
 
         # --- Handle PDFs ---
-        pdf_urls = _resolve_pdf_urls(item)
+        pdf_urls, p_logs = _resolve_pdf_urls(item)
+        if pdf_urls:
+            try:
+                await status_msg.edit_text(f"[{idx}/{total}] {title} - PDFs\n\nDecryption Logs:\n{p_logs}")
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+
         for pidx, pdf_url in enumerate(pdf_urls):
             try:
                 pdf_label = f"{title} - PDF{pidx + 1}" if len(pdf_urls) > 1 else f"{title} - PDF"
@@ -903,8 +947,12 @@ async def handle_batch(client, message):
                 if not success or not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
                     progress_data.pop(task_id, None)
                     updater.cancel()
-                    print(f"[BATCH] PDF download failed for: {pdf_label} - {err}")
                     fail_count += 1
+                    try:
+                        await status_msg.edit_text(f"PDF download failed for {pdf_label}:\n{err}")
+                        await asyncio.sleep(3)
+                    except Exception:
+                        pass
                     continue
 
                 file_size = os.path.getsize(pdf_path)
@@ -928,8 +976,12 @@ async def handle_batch(client, message):
                 success_count += 1
 
             except Exception as e:
-                print(f"[BATCH] Error processing PDF {pdf_label}: {e}")
                 fail_count += 1
+                try:
+                    await status_msg.edit_text(f"Error processing PDF {pdf_label}:\n{e}")
+                    await asyncio.sleep(3)
+                except Exception:
+                    pass
             finally:
                 try:
                     if os.path.exists(pdf_path):
