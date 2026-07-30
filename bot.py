@@ -53,7 +53,6 @@ import re
 import time
 import base64
 import gzip
-import hashlib
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -251,78 +250,6 @@ def _save_api_config():
 _load_api_config()
 
 # ---------------------------------------------------------------------------
-# AES Decryption for ClassX encrypted links
-# ---------------------------------------------------------------------------
-
-def _decrypt_classx(encrypted_str, key_str=None):
-    """Decrypt a ClassX encrypted string.
-
-    Format: <base64_ciphertext>:<base64_iv>
-    Key format: <base64_key>:<base64_iv> (IV in key is ignored, we use data IV)
-    Returns: (decrypted_string, error_message)
-    """
-    try:
-        parts = encrypted_str.split(":")
-        if len(parts) < 2:
-            return None, "Invalid format (no colon)"
-        
-        # Sometimes base64 strings from JSON need padding fixed
-        def fix_b64(s):
-            return s + "=" * (-len(s) % 4)
-
-        ciphertext = base64.b64decode(fix_b64(parts[0]))
-        iv = base64.b64decode(fix_b64(parts[1]))
-
-        if key_str:
-            key_parts = key_str.split(":")
-            raw_key_string = key_parts[0]
-        else:
-            return None, "No key provided"
-
-        # We will try multiple ways to derive the key, because we don't know exactly what AppX uses
-        key_candidates = [
-            base64.b64decode(fix_b64(raw_key_string)), # 16 bytes -> AES-128
-            raw_key_string.encode('utf-8'), # 24 bytes -> AES-192
-            hashlib.md5(raw_key_string.encode('utf-8')).digest(), # 16 bytes -> AES-128
-            hashlib.sha256(raw_key_string.encode('utf-8')).digest(), # 32 bytes -> AES-256
-        ]
-
-        # Add common global keys
-        for global_str in [b"appxapi", b"0123456789abcdef", b"fedcba9876543210", b"ytsejt73it7id73t"]:
-            key_candidates.append(hashlib.md5(global_str).digest())
-            key_candidates.append((global_str + b'\0'*16)[:16])
-            if len(global_str) in [16, 24, 32]:
-                key_candidates.append(global_str)
-
-        last_err = ""
-        for idx, key in enumerate(key_candidates):
-            for mode in [AES.MODE_CBC, AES.MODE_ECB]:
-                try:
-                    if mode == AES.MODE_CBC:
-                        cipher = AES.new(key, mode, iv)
-                    else:
-                        cipher = AES.new(key, mode)
-                        
-                    decrypted = unpad(cipher.decrypt(ciphertext), AES.block_size)
-                    dec_str = decrypted.decode("utf-8")
-                    # ClassX URLs should start with http
-                    if dec_str.startswith("http"):
-                        return dec_str, None
-                except Exception as e:
-                    last_err = f"{mode}: {str(e)}"
-                    continue
-
-        # If all failed, let's return the raw bytes of the first method (standard base64) for debugging
-        cipher = AES.new(key_candidates[0], AES.MODE_CBC, iv)
-        raw_dec = cipher.decrypt(ciphertext)
-        return None, f"All keys failed. Last error: {last_err}. Raw start: {repr(raw_dec[:60])}"
-
-    except Exception as e:
-        import traceback
-        err_str = traceback.format_exc().strip().split('\n')[-1]
-        return None, err_str
-
-# ---------------------------------------------------------------------------
 # ClassX API helpers
 # ---------------------------------------------------------------------------
 
@@ -371,59 +298,9 @@ def _get_video_details(course_id, video_id):
            f"?course_id={course_id}&folder_wise_course=1&ytflag=0&video_id={video_id}")
     return _api_get(url)
 
-def _resolve_video_url(detail_data, quality="720p"):
-    """Decrypt the best available video URL from detail data."""
-    logs = []
-    # Try encrypted_links first (HLS streams)
-    enc_links = detail_data.get("encrypted_links", [])
-    logs.append(f"Found {len(enc_links)} encrypted video links.")
-    
-    for link in enc_links:
-        if link.get("quality") == quality:
-            key = link.get("key", "")
-            logs.append(f"Trying to decrypt {quality} video link...")
-            decrypted, err = _decrypt_classx(link.get("path", ""), key)
-            if decrypted:
-                logs.append(f"Success! URL: {decrypted[:60]}...")
-                return decrypted, "video", "\n".join(logs)
-            else:
-                logs.append(f"Failed to decrypt {quality} video link. Error: {err}")
-
-    # Fallback: try any available quality
-    for link in enc_links:
-        key = link.get("key", "")
-        logs.append(f"Fallback: Trying to decrypt {link.get('quality')} video link...")
-        decrypted, err = _decrypt_classx(link.get("path", ""), key)
-        if decrypted:
-            logs.append(f"Success! URL: {decrypted[:60]}...")
-            return decrypted, "video", "\n".join(logs)
-        else:
-            logs.append(f"Fallback Failed. Error: {err}")
-
-    # Try download_links
-    dl_links = detail_data.get("download_links", [])
-    logs.append(f"Found {len(dl_links)} unencrypted download links.")
-    for link in dl_links:
-        if link.get("quality") == quality:
-            path = link.get("path", "")
-            if path.startswith("http"):
-                logs.append(f"Using unencrypted {quality} link.")
-                return path, "video", "\n".join(logs)
-
-    # Try file_link
-    file_link = detail_data.get("file_link", "")
-    if file_link and file_link.startswith("http"):
-        logs.append(f"Using direct file_link.")
-        return file_link, "video", "\n".join(logs)
-
-    logs.append("Could not find or decrypt any video URL.")
-    return None, None, "\n".join(logs)
-
 def _resolve_pdf_urls(item_data):
-    """Decrypt PDF URLs from item data."""
+    """Extract PDF URLs from item data."""
     pdfs = []
-    logs = []
-    pdf_key = item_data.get("pdf_encryption_key", "")
     
     # ClassX can have multiple PDFs (study_material_link, pdf_link, pdf_link2, pdf_link3, etc.)
     pdf_fields = ["study_material_link", "pdf_link"] + [f"pdf_link{i}" for i in range(2, 11)]
@@ -433,17 +310,8 @@ def _resolve_pdf_urls(item_data):
         if not link:
             continue
         if link.startswith("http"):
-            logs.append(f"Found unencrypted {field}.")
             pdfs.append(link)
-        elif ":" in link:
-            logs.append(f"Trying to decrypt {field}...")
-            decrypted, err = _decrypt_classx(link, pdf_key)
-            if decrypted:
-                logs.append(f"Success! URL: {decrypted[:60]}...")
-                pdfs.append(decrypted)
-            else:
-                logs.append(f"Failed to decrypt {field}. Error: {err}")
-    return pdfs, "\n".join(logs)
+    return pdfs
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -880,105 +748,15 @@ async def handle_batch(client, message):
         material_type = item.get("material_type", "")
 
         try:
-            await status_msg.edit_text(f"Processing {idx}/{total}...\n\nTitle: {title}\nType: {material_type}")
+            await status_msg.edit_text(f"Processing {idx}/{total}...\n\nTitle: {title}")
         except Exception:
             pass
 
-        # --- Handle VIDEO ---
-        if material_type == "VIDEO":
-            try:
-                try:
-                    await status_msg.edit_text(f"[{idx}/{total}] Fetching video details for: {title}...")
-                except Exception:
-                    pass
-
-                detail_resp = await asyncio.to_thread(
-                    _get_video_details, course_id, item_id
-                )
-                detail = detail_resp.get("data", {})
-
-                video_url, _, v_logs = _resolve_video_url(detail, quality="720p")
-
-                try:
-                    await status_msg.edit_text(f"[{idx}/{total}] {title}\n\nDecryption Logs:\n{v_logs}")
-                except Exception:
-                    pass
-                await asyncio.sleep(2)
-
-                if not video_url:
-                    fail_count += 1
-                    continue
-
-                # Download
-                task_id = f"batch_{item_id}_{int(time.time())}"
-                filename = f"{title}.mp4".replace("/", "-").replace("\\", "-")
-                output_path = str(DOWNLOAD_DIR / filename)
-
-                progress_data[task_id] = {
-                    "phase": f"Downloading...\n{title}",
-                    "current": 0,
-                    "total": 0,
-                }
-
-                updater = asyncio.create_task(_progress_loop(status_msg, task_id))
-
-                if video_url.endswith(".m3u8") or "m3u8" in video_url:
-                    success, err = await _download_video(video_url, output_path, task_id)
-                else:
-                    success, err = await _download_direct(video_url, output_path, task_id)
-
-                if not success or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-                    progress_data.pop(task_id, None)
-                    updater.cancel()
-                    fail_count += 1
-                    try:
-                        await status_msg.edit_text(f"Download failed for {title}:\n{err}")
-                        await asyncio.sleep(3)
-                    except Exception:
-                        pass
-                    continue
-
-                # Upload
-                file_size = os.path.getsize(output_path)
-                progress_data[task_id] = {
-                    "phase": f"Uploading...\n{title}",
-                    "current": 0,
-                    "total": file_size,
-                }
-
-                await client.send_video(
-                    chat_id=message.chat.id,
-                    video=output_path,
-                    file_name=filename,
-                    caption=title,
-                    supports_streaming=True,
-                    progress=_upload_progress,
-                    progress_args=(task_id,),
-                )
-
-                progress_data.pop(task_id, None)
-                updater.cancel()
-                success_count += 1
-
-            except Exception as e:
-                fail_count += 1
-                try:
-                    await status_msg.edit_text(f"Error processing video {title}:\n{e}")
-                    await asyncio.sleep(3)
-                except Exception:
-                    pass
-            finally:
-                try:
-                    if os.path.exists(output_path):
-                        os.remove(output_path)
-                except OSError:
-                    pass
-
         # --- Handle PDFs ---
-        pdf_urls, p_logs = _resolve_pdf_urls(item)
+        pdf_urls = _resolve_pdf_urls(item)
         if pdf_urls:
             try:
-                await status_msg.edit_text(f"[{idx}/{total}] {title} - PDFs\n\nDecryption Logs:\n{p_logs}")
+                await status_msg.edit_text(f"[{idx}/{total}] {title} - Found {len(pdf_urls)} PDFs")
             except Exception:
                 pass
             await asyncio.sleep(2)
