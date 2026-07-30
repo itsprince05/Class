@@ -279,8 +279,16 @@ def _decrypt_classx(encrypted_str, key_str=None):
             return None, "No key provided"
 
         cipher = AES.new(key, AES.MODE_CBC, iv)
-        decrypted = unpad(cipher.decrypt(ciphertext), AES.block_size)
-        return decrypted.decode("utf-8"), None
+        raw_decrypted = cipher.decrypt(ciphertext)
+        
+        try:
+            decrypted = unpad(raw_decrypted, AES.block_size)
+            return decrypted.decode("utf-8"), None
+        except ValueError as e:
+            # If padding is wrong, let's see what the raw decrypted bytes look like
+            raw_str = repr(raw_decrypted[:60])
+            return None, f"Padding Error. Raw start: {raw_str}"
+
     except Exception as e:
         import traceback
         err_str = traceback.format_exc().strip().split('\n')[-1]
@@ -389,7 +397,10 @@ def _resolve_pdf_urls(item_data):
     logs = []
     pdf_key = item_data.get("pdf_encryption_key", "")
     
-    for field in ["pdf_link", "pdf_link2"]:
+    # ClassX can have multiple PDFs (pdf_link, pdf_link2, pdf_link3, etc.)
+    pdf_fields = ["pdf_link"] + [f"pdf_link{i}" for i in range(2, 11)]
+    
+    for field in pdf_fields:
         link = item_data.get(field, "")
         if not link:
             continue
@@ -814,7 +825,14 @@ async def handle_batch(client, message):
 
     total = len(items)
     video_count = sum(1 for i in items if i.get("material_type") == "VIDEO")
-    pdf_count = sum(1 for i in items if i.get("pdf_link") or i.get("pdf_link2"))
+    
+    # Count total PDFs accurately
+    pdf_fields = ["pdf_link"] + [f"pdf_link{i}" for i in range(2, 11)]
+    pdf_count = 0
+    for i in items:
+        for field in pdf_fields:
+            if i.get(field):
+                pdf_count += 1
 
     await status_msg.edit_text(
         f"Found {total} items...\n"
