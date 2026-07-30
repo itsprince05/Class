@@ -661,17 +661,10 @@ def _upload_progress(current, total, task_id):
 async def handle_start(client, message):
     await message.reply_text(
         "Bot is running...\n\n"
-        "Send an m3u8 / HLS video link to download and upload.\n\n"
-        "Commands:\n"
         "/start - Show this message\n"
-        "/batch <parent_id> - Batch download chapter\n"
-        "/setapi - Set ClassX API credentials\n"
+        "/batch - Batch download chapter\n"
         "/api - Show API config\n"
-        "/clearapi - Remove API credentials\n"
-        "/setheaders - Set custom request headers\n"
-        "/headers - Show current headers\n"
-        "/clearheaders - Remove custom headers\n"
-        "/test <url> - Test URL from server\n"
+        "/setapi - Set ClassX API credentials\n"
         "/update - Pull from GitHub and restart"
     )
 
