@@ -289,16 +289,21 @@ def _decrypt_classx(encrypted_str, key_str=None):
 
         last_err = ""
         for idx, key in enumerate(key_candidates):
-            try:
-                cipher = AES.new(key, AES.MODE_CBC, iv)
-                decrypted = unpad(cipher.decrypt(ciphertext), AES.block_size)
-                dec_str = decrypted.decode("utf-8")
-                # ClassX URLs should start with http
-                if dec_str.startswith("http"):
-                    return dec_str, None
-            except Exception as e:
-                last_err = str(e)
-                continue
+            for mode in [AES.MODE_CBC, AES.MODE_ECB]:
+                try:
+                    if mode == AES.MODE_CBC:
+                        cipher = AES.new(key, mode, iv)
+                    else:
+                        cipher = AES.new(key, mode)
+                        
+                    decrypted = unpad(cipher.decrypt(ciphertext), AES.block_size)
+                    dec_str = decrypted.decode("utf-8")
+                    # ClassX URLs should start with http
+                    if dec_str.startswith("http"):
+                        return dec_str, None
+                except Exception as e:
+                    last_err = f"{mode}: {str(e)}"
+                    continue
 
         # If all failed, let's return the raw bytes of the first method (standard base64) for debugging
         cipher = AES.new(key_candidates[0], AES.MODE_CBC, iv)
