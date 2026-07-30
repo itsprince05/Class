@@ -60,7 +60,7 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import FloodWait
 from dotenv import load_dotenv
 from Crypto.Cipher import AES
@@ -106,9 +106,16 @@ async def fast_save_file(self: Client, *args, **kwargs) -> Union[InputFile, Inpu
     sem = asyncio.Semaphore(10)  # Reduced from 50 to prevent Telegram rate limits
     uploaded_bytes = 0
     
+    task_id = progress_args[0] if progress_args else None
+    
     async def upload_part(part_index):
+        if task_id in cancelled_tasks:
+            raise Exception("Cancelled by user")
+            
         nonlocal uploaded_bytes
         async with sem:
+            if task_id in cancelled_tasks:
+                raise Exception("Cancelled by user")
             with open(path, "rb") as f:
                 f.seek(part_index * part_size)
                 chunk = f.read(part_size)
@@ -429,7 +436,8 @@ async def _progress_loop(status_msg, task_id):
 
         if text != last_text:
             try:
-                await status_msg.edit_text(text)
+                btn = InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"cancel_{task_id}")]])
+                await status_msg.edit_text(text, reply_markup=btn)
                 last_text = text
             except Exception:
                 pass
@@ -453,6 +461,8 @@ async def _download_direct(url, output_path, task_id):
         try:
             with urlopen(req, timeout=30) as response, open(output_path, 'wb') as out_file:
                 while True:
+                    if task_id in cancelled_tasks:
+                        return False, "Cancelled by user"
                     if task_id not in progress_data:
                         return False, "Cancelled"
                     chunk = response.read(65536)
@@ -517,8 +527,12 @@ async def _download_video(url, output_path, task_id):
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-
+        active_processes[task_id] = process
         _, stderr_bytes = await process.communicate()
+        active_processes.pop(task_id, None)
+        
+        if task_id in cancelled_tasks:
+            return False, "Cancelled by user"
 
         if process.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
             monitor.cancel()
@@ -557,8 +571,12 @@ async def _download_video(url, output_path, task_id):
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
-
+    active_processes[task_id] = process
     _, stderr_bytes = await process.communicate()
+    active_processes.pop(task_id, None)
+
+    if task_id in cancelled_tasks:
+        return False, "Cancelled by user"
 
     # Stop monitor
     progress_data.pop(task_id, None)
@@ -833,6 +851,30 @@ async def handle_batch(client, message):
             f"Done: {success_count}\n"
             f"Failed: {fail_count}"
         )
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Callback Query Handler (for cancellation)
+# ---------------------------------------------------------------------------
+
+@app.on_callback_query(filters.regex(r"^cancel_"))
+async def handle_cancel_task(client, callback_query: CallbackQuery):
+    task_id = callback_query.data.split("cancel_", 1)[1]
+    cancelled_tasks.add(task_id)
+    
+    # Kill subprocess if any
+    proc = active_processes.get(task_id)
+    if proc:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+            
+    await callback_query.answer("Cancelling task...", show_alert=True)
+    try:
+        await callback_query.message.edit_text(f"{callback_query.message.text}\n\nTask Cancelled ❌")
     except Exception:
         pass
 
