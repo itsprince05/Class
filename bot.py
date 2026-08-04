@@ -417,25 +417,23 @@ async def start_cmd(client: Client, message: Message):
     user = message.from_user
     mention = user.mention if user else "User"
     welcome_text = (
-        f"👋 **Hello {mention}!**\n\n"
-        f"🚀 **Welcome to PDF & Video Downloader Bot**\n\n"
-        f"📌 **Supported Links:**\n"
-        f"• 📄 **PDF Documents** (Direct PDF, Google Drive PDF, ClassX encrypted PDF)\n"
-        f"• 🎥 **Video Streams** (YouTube, m3u8, MP4, ClassX/Appx DRM, Drive Video)\n\n"
-        f"💡 **Usage Guide:**\n"
-        f"1️⃣ Upload a `.txt` file containing `Name : URL` or `URL` links.\n"
-        f"2️⃣ Or send a direct PDF or Video URL in chat.\n"
-        f"3️⃣ Choose range & video resolution to start processing!\n\n"
-        f"⚡ *Multi-part parallel fast uploader active.*"
+        f"Hello {mention}!\n\n"
+        f"Welcome to PDF & Video Downloader Bot\n\n"
+        f"Supported Links:\n"
+        f"• PDF Documents (Direct PDF, Google Drive PDF, ClassX encrypted PDF)\n"
+        f"• Video Streams (YouTube, m3u8, MP4, ClassX/Appx DRM, Drive Video)\n\n"
+        f"Usage Guide:\n"
+        f"1. Upload a .txt file containing Name : URL or URL links.\n"
+        f"2. Or send a direct PDF or Video URL in chat."
     )
     buttons = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📜 Help & Guide", callback_data="help_menu"),
-            InlineKeyboardButton("⚡ Commands", callback_data="commands_menu")
+            InlineKeyboardButton("Help & Guide", callback_data="help_menu"),
+            InlineKeyboardButton("Commands", callback_data="commands_menu")
         ],
         [
-            InlineKeyboardButton("🔄 Update Bot", callback_data="update_bot"),
-            InlineKeyboardButton("👨‍💻 Owner", user_id=OWNER_ID if OWNER_ID else 1934839437)
+            InlineKeyboardButton("Update Bot", callback_data="update_bot"),
+            InlineKeyboardButton("Owner", user_id=OWNER_ID if OWNER_ID else 1934839437)
         ]
     ])
     await message.reply_text(welcome_text, reply_markup=buttons)
@@ -444,10 +442,10 @@ async def start_cmd(client: Client, message: Message):
 async def update_cmd(client: Client, message: Message):
     """Update command handler to pull code, upgrade yt-dlp, and restart."""
     if OWNER_ID and message.from_user.id != OWNER_ID:
-        await message.reply_text("❌ Only the bot owner can execute `/update` command.")
+        await message.reply_text("Only the bot owner can execute /update command.")
         return
         
-    msg = await message.reply_text("🔄 **Starting Bot Update...**\n\n1️⃣ Pulling latest code via Git...")
+    msg = await message.reply_text("Starting Bot Update...\n\n1. Pulling latest code via Git...")
     
     git_out = ""
     try:
@@ -456,14 +454,14 @@ async def update_cmd(client: Client, message: Message):
     except Exception as e:
         git_out = f"Git error: {e}"
         
-    await msg.edit_text(f"🔄 **Upgrading yt-dlp...**\n\nGit output:\n`{git_out[:300]}`")
+    await msg.edit_text(f"Upgrading yt-dlp...\n\nGit output:\n{git_out[:300]}")
     
     try:
         subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"], capture_output=True, timeout=60)
     except Exception:
         pass
         
-    await msg.edit_text("✅ **Update complete! Restarting process...**")
+    await msg.edit_text("Update complete! Restarting process...")
     
     # Save notification state
     RESTART_FILE.write_text(json.dumps({"chat_id": message.chat.id, "time": time.time()}))
@@ -477,7 +475,7 @@ async def cancel_cmd(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id in user_states:
         user_states.pop(user_id, None)
-        await message.reply_text("🛑 Active setup state cleared.")
+        await message.reply_text("Active setup state cleared.")
     
     cancelled = False
     for task_id in list(progress_data.keys()):
@@ -491,9 +489,9 @@ async def cancel_cmd(client: Client, message: Message):
             cancelled = True
             
     if cancelled:
-        await message.reply_text("🛑 Stopped active download task!")
+        await message.reply_text("Stopped active download task!")
     else:
-        await message.reply_text("ℹ️ No active task running.")
+        await message.reply_text("No active task running.")
 
 # ---------------------------------------------------------------------------
 # Callback Query Handler
@@ -506,52 +504,52 @@ async def callback_handler(client: Client, query: CallbackQuery):
     
     if data == "help_menu":
         text = (
-            "📖 **Help & Instructions**\n\n"
-            "• **Batch Downloading:** Send a `.txt` file formatted with links:\n"
-            "  `Topic Name : https://example.com/video.m3u8`\n"
-            "  `Document Title : https://example.com/file.pdf`\n\n"
-            "• **Single Download:** Send any direct PDF or Video link in chat.\n"
-            "• **Supported Types:** PDF documents & Video streams.\n"
-            "• **Cancel:** Click ⛔ Stop on progress card or send `/stop`."
+            "Help & Instructions\n\n"
+            "• Batch Downloading: Send a .txt file formatted with links:\n"
+            "  Topic Name : https://example.com/video.m3u8\n"
+            "  Document Title : https://example.com/file.pdf\n\n"
+            "• Single Download: Send any direct PDF or Video link in chat.\n"
+            "• Supported Types: PDF documents & Video streams.\n"
+            "• Cancel: Click Stop on progress card or send /stop."
         )
-        buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="start_menu")]])
+        buttons = InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="start_menu")]])
         await query.message.edit_text(text, reply_markup=buttons)
         
     elif data == "commands_menu":
         text = (
-            "⚡ **Available Commands:**\n\n"
-            "• `/start` - Launch interactive bot menu\n"
-            "• `/update` (or `/upate`) - Pull updates & restart bot\n"
-            "• `/stop` (or `/cancel`) - Cancel current active task"
+            "Available Commands:\n\n"
+            "• /start - Launch interactive bot menu\n"
+            "• /update (or /upate) - Pull updates & restart bot\n"
+            "• /stop (or /cancel) - Cancel current active task"
         )
-        buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="start_menu")]])
+        buttons = InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="start_menu")]])
         await query.message.edit_text(text, reply_markup=buttons)
         
     elif data == "start_menu":
         mention = query.from_user.mention
         welcome_text = (
-            f"👋 **Hello {mention}!**\n\n"
-            f"🚀 **Welcome to PDF & Video Downloader Bot**\n\n"
-            f"📌 **Supported Links:**\n"
-            f"• 📄 **PDF Documents**\n"
-            f"• 🎥 **Video Streams**\n\n"
-            f"Send a `.txt` file or link to get started!"
+            f"Hello {mention}!\n\n"
+            f"Welcome to PDF & Video Downloader Bot\n\n"
+            f"Supported Links:\n"
+            f"• PDF Documents\n"
+            f"• Video Streams\n\n"
+            f"Send a .txt file or link to get started!"
         )
         buttons = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("📜 Help & Guide", callback_data="help_menu"),
-                InlineKeyboardButton("⚡ Commands", callback_data="commands_menu")
+                InlineKeyboardButton("Help & Guide", callback_data="help_menu"),
+                InlineKeyboardButton("Commands", callback_data="commands_menu")
             ],
             [
-                InlineKeyboardButton("🔄 Update Bot", callback_data="update_bot"),
-                InlineKeyboardButton("👨‍💻 Owner", user_id=OWNER_ID if OWNER_ID else 1934839437)
+                InlineKeyboardButton("Update Bot", callback_data="update_bot"),
+                InlineKeyboardButton("Owner", user_id=OWNER_ID if OWNER_ID else 1934839437)
             ]
         ])
         await query.message.edit_text(welcome_text, reply_markup=buttons)
         
     elif data == "update_bot":
         if OWNER_ID and user_id != OWNER_ID:
-            await query.answer("❌ Owner only command", show_alert=True)
+            await query.answer("Owner only command", show_alert=True)
             return
         await query.answer("Starting update process...")
         await update_cmd(client, query.message)
@@ -564,7 +562,7 @@ async def callback_handler(client: Client, query: CallbackQuery):
                 active_processes[task_id].kill()
             except Exception:
                 pass
-        await query.answer("🛑 Task cancellation requested!", show_alert=True)
+        await query.answer("Task cancellation requested!", show_alert=True)
         
     elif data.startswith("res_"):
         res = data.replace("res_", "")
@@ -583,10 +581,10 @@ async def callback_handler(client: Client, query: CallbackQuery):
 async def document_handler(client: Client, message: Message):
     doc = message.document
     if not doc.file_name.endswith(".txt"):
-        await message.reply_text("❌ Please send a `.txt` file containing PDF or Video links.")
+        await message.reply_text("Please send a .txt file containing PDF or Video links.")
         return
         
-    status_msg = await message.reply_text("📥 Reading TXT file...")
+    status_msg = await message.reply_text("Reading TXT file...")
     txt_path = await message.download(file_name=str(DOWNLOAD_DIR / f"{message.id}.txt"))
     
     with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -598,7 +596,7 @@ async def document_handler(client: Client, message: Message):
         pass
         
     if not lines:
-        await status_msg.edit_text("❌ The uploaded TXT file is empty.")
+        await status_msg.edit_text("The uploaded TXT file is empty.")
         return
         
     items = []
@@ -615,7 +613,7 @@ async def document_handler(client: Client, message: Message):
             items.append({"index": idx, "name": name, "url": url})
             
     if not items:
-        await status_msg.edit_text("❌ No valid links found in the uploaded file.")
+        await status_msg.edit_text("No valid links found in the uploaded file.")
         return
         
     user_id = message.from_user.id
@@ -627,9 +625,9 @@ async def document_handler(client: Client, message: Message):
     }
     
     await status_msg.edit_text(
-        f"📑 **Found {len(items)} links in file.**\n\n"
-        f"Send the start & end range in format `start-end` or single number.\n"
-        f"Example: `1-{len(items)}` or `1-10`"
+        f"Found {len(items)} links in file.\n\n"
+        f"Send the start & end range in format start-end or single number.\n"
+        f"Example: 1-{len(items)} or 1-10"
     )
 
 @app.on_message(filters.text & ~filters.command(["start", "update", "upate", "stop", "cancel"]))
@@ -652,14 +650,14 @@ async def text_handler(client: Client, message: Message):
                 start_idx = int(p[0].strip())
                 end_idx = int(p[1].strip())
             except ValueError:
-                await message.reply_text(f"❌ Invalid range format. Send like `1-{total}`.")
+                await message.reply_text(f"Invalid range format. Send like 1-{total}.")
                 return
         else:
             try:
                 start_idx = int(text)
                 end_idx = total
             except ValueError:
-                await message.reply_text(f"❌ Invalid range number. Send like `1-{total}`.")
+                await message.reply_text(f"Invalid range number. Send like 1-{total}.")
                 return
                 
         start_idx = max(1, min(start_idx, total))
@@ -671,17 +669,17 @@ async def text_handler(client: Client, message: Message):
         
         quality_markup = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("📱 360p", callback_data="res_360"),
-                InlineKeyboardButton("💻 480p", callback_data="res_480")
+                InlineKeyboardButton("360p", callback_data="res_360"),
+                InlineKeyboardButton("480p", callback_data="res_480")
             ],
             [
-                InlineKeyboardButton("📺 720p HD", callback_data="res_720"),
-                InlineKeyboardButton("🖥️ 1080p FHD", callback_data="res_1080")
+                InlineKeyboardButton("720p", callback_data="res_720"),
+                InlineKeyboardButton("1080p", callback_data="res_1080")
             ]
         ])
         await message.reply_text(
-            f"✅ **Selected Range:** {start_idx} to {end_idx} ({len(selected_items)} items)\n\n"
-            f"🎬 **Select Video Resolution:**",
+            f"Selected Range: {start_idx} to {end_idx} ({len(selected_items)} items)\n\n"
+            f"Select Video Resolution:",
             reply_markup=quality_markup
         )
         return
@@ -716,7 +714,7 @@ async def text_handler(client: Client, message: Message):
             asyncio.create_task(run_batch_download(client, message, state))
         return
     else:
-        await message.reply_text("❌ Please send a valid PDF or Video URL.")
+        await message.reply_text("Please send a valid PDF or Video URL.")
 
 # ---------------------------------------------------------------------------
 # Processing Engine (PDF & Video Download & Upload)
@@ -735,7 +733,7 @@ async def process_single_item(client: Client, chat_id: int, item: Dict[str, Any]
     filename = f"{safe_name}{ext}"
     output_path = str(DOWNLOAD_DIR / f"{task_id}{ext}")
     
-    status_msg = await client.send_message(chat_id, f"⌛ **Starting download for:** `{name}`")
+    status_msg = await client.send_message(chat_id, f"Starting download for: {name}")
     progress_data[task_id] = {"phase": "Downloading", "current": 0, "total": 0}
     updater = asyncio.create_task(_progress_loop(status_msg, task_id, title=name, is_pdf=is_pdf))
     
@@ -748,13 +746,13 @@ async def process_single_item(client: Client, chat_id: int, item: Dict[str, Any]
         if not success:
             progress_data.pop(task_id, None)
             updater.cancel()
-            await status_msg.edit_text(f"❌ **Download Failed:** `{name}`\n\n`{err[:1000]}`")
+            await status_msg.edit_text(f"Download Failed: {name}\n\n{err[:1000]}")
             return
             
         if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
             progress_data.pop(task_id, None)
             updater.cancel()
-            await status_msg.edit_text("❌ **Error:** Downloaded file is empty.")
+            await status_msg.edit_text("Error: Downloaded file is empty.")
             return
             
         file_size = os.path.getsize(output_path)
@@ -769,7 +767,7 @@ async def process_single_item(client: Client, chat_id: int, item: Dict[str, Any]
                 chat_id=chat_id,
                 document=output_path,
                 file_name=filename,
-                caption=f"📄 **{name}**",
+                caption=f"{name}",
                 progress=upload_prog,
                 progress_args=(task_id,)
             )
@@ -787,7 +785,7 @@ async def process_single_item(client: Client, chat_id: int, item: Dict[str, Any]
                     width=width,
                     height=height,
                     thumb=thumb if thumb and os.path.exists(thumb) else None,
-                    caption=f"🎥 **{name}** [{quality}p]",
+                    caption=f"{name} [{quality}p]",
                     supports_streaming=True,
                     progress=upload_prog,
                     progress_args=(task_id,)
@@ -810,7 +808,7 @@ async def process_single_item(client: Client, chat_id: int, item: Dict[str, Any]
     except Exception as e:
         progress_data.pop(task_id, None)
         updater.cancel()
-        await status_msg.edit_text(f"❌ **Error processing `{name}`:**\n`{e}`")
+        await status_msg.edit_text(f"Error processing {name}:\n{e}")
     finally:
         if os.path.exists(output_path):
             try:
@@ -825,17 +823,17 @@ async def run_batch_download(client: Client, message: Message, state: Dict[str, 
     quality = state.get("quality", "720")
     total = len(items)
     
-    summary_msg = await client.send_message(chat_id, f"🚀 **Starting Batch Processing ({total} items)...**")
+    summary_msg = await client.send_message(chat_id, f"Starting Batch Processing ({total} items)...")
     
     for i, item in enumerate(items, 1):
         if any(task.startswith(str(chat_id)) for task in cancelled_tasks):
-            await client.send_message(chat_id, "🛑 **Batch download cancelled by user.**")
+            await client.send_message(chat_id, "Batch download cancelled by user.")
             break
             
         await process_single_item(client, chat_id, item, quality=quality)
         await asyncio.sleep(1)
         
-    await summary_msg.edit_text(f"✅ **Batch Completed!** Processed {total} item(s).")
+    await summary_msg.edit_text(f"Batch Completed! Processed {total} item(s).")
 
 # ---------------------------------------------------------------------------
 # Restart Notification & Entry Point
