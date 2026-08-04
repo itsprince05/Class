@@ -386,46 +386,58 @@ def _find_url_in_dict(obj):
 from urllib.parse import urlparse, parse_qs, unquote
 
 def _decode_jwt_or_base64(token_str):
-    """Try to decode JWT token payload or Base64 string to find video URLs."""
+    """Try to decode JWT token payload, Base64 string, or AES to find video URLs."""
     if not token_str or not isinstance(token_str, str):
         return ""
 
-    # 1. Try AES decryption
+    token_str = token_str.strip()
+
+    # 1. Try direct AES decryption
     dec = _decrypt_classx_url(token_str)
-    if dec:
+    if dec and dec.startswith("http"):
         return dec
 
-    # 2. Try JWT token (parts separated by dot)
+    # 2. Try URL decoding if double encoded
+    try:
+        unquoted = unquote(token_str)
+        if unquoted != token_str and unquoted.startswith("http"):
+            return unquoted
+    except Exception:
+        pass
+
+    # 3. Try JWT token (parts separated by dot e.g. eyJ...)
     if "." in token_str:
         parts = token_str.split(".")
         for part in parts:
-            if len(part) > 10:
-                try:
-                    part_b64 = part + "=" * ((4 - len(part) % 4) % 4)
-                    decoded_bytes = base64.urlsafe_b64decode(part_b64)
-                    decoded_str = decoded_bytes.decode("utf-8", errors="ignore")
-                    urls = re.findall(r'https?://[^\s"\'\\{}]+', decoded_str)
-                    for u in urls:
-                        if any(k in u.lower() for k in [".m3u8", ".mp4", "stream", "akamai", "cdn", "hls"]):
-                            return u
-                    if urls:
-                        return urls[0]
-                except Exception:
-                    pass
+            if len(part) > 8:
+                for b64_fn in [base64.urlsafe_b64decode, base64.b64decode]:
+                    try:
+                        part_b64 = part + "=" * ((4 - len(part) % 4) % 4)
+                        decoded_bytes = b64_fn(part_b64)
+                        decoded_str = decoded_bytes.decode("utf-8", errors="ignore")
+                        urls = re.findall(r'https?://[^\s"\'\\{}]+', decoded_str)
+                        for u in urls:
+                            if any(k in u.lower() for k in [".m3u8", ".mp4", "stream", "akamai", "cdn", "hls"]):
+                                return u
+                        if urls:
+                            return urls[0]
+                    except Exception:
+                        pass
 
-    # 3. Try standard Base64
-    try:
-        b64 = token_str + "=" * ((4 - len(token_str) % 4) % 4)
-        decoded_bytes = base64.urlsafe_b64decode(b64)
-        decoded_str = decoded_bytes.decode("utf-8", errors="ignore")
-        urls = re.findall(r'https?://[^\s"\'\\{}]+', decoded_str)
-        for u in urls:
-            if any(k in u.lower() for k in [".m3u8", ".mp4", "stream", "akamai", "cdn", "hls"]):
-                return u
-        if urls:
-            return urls[0]
-    except Exception:
-        pass
+    # 4. Try standard Base64 / URL-safe Base64
+    for b64_fn in [base64.urlsafe_b64decode, base64.b64decode]:
+        try:
+            b64 = token_str + "=" * ((4 - len(token_str) % 4) % 4)
+            decoded_bytes = b64_fn(b64)
+            decoded_str = decoded_bytes.decode("utf-8", errors="ignore")
+            urls = re.findall(r'https?://[^\s"\'\\{}]+', decoded_str)
+            for u in urls:
+                if any(k in u.lower() for k in [".m3u8", ".mp4", "stream", "akamai", "cdn", "hls"]):
+                    return u
+            if urls:
+                return urls[0]
+        except Exception:
+            pass
 
     return ""
 
@@ -439,19 +451,19 @@ def _extract_stream_from_secure_player(url):
 
     print(f"[PLAYER] Resolving Appx player URL: {url}")
     
-    # 1. Check query params for embedded url/link/file/token
+    # 1. Check ALL query params in URL
     try:
         parsed = urlparse(url)
         qs = parse_qs(parsed.query)
-        for key in ["token", "url", "link", "stream", "file", "src", "target", "data"]:
-            if key in qs and qs[key]:
-                val = unquote(qs[key][0])
-                if val.startswith("http") and ("m3u8" in val or "mp4" in val or "akamai" in val):
-                    print(f"[PLAYER] Found direct URL in query param '{key}': {val}")
+        for param_key, val_list in qs.items():
+            for raw_val in val_list:
+                val = unquote(raw_val)
+                if val.startswith("http") and ("m3u8" in val or "mp4" in val or "akamai" in val or "hls" in val):
+                    print(f"[PLAYER] Found direct URL in param '{param_key}': {val}")
                     return val
                 decoded = _decode_jwt_or_base64(val)
                 if decoded:
-                    print(f"[PLAYER] Decoded URL from query param '{key}': {decoded}")
+                    print(f"[PLAYER] Decoded URL from param '{param_key}': {decoded}")
                     return decoded
     except Exception as e:
         print(f"[PLAYER] Query param parse error: {e}")
@@ -462,7 +474,7 @@ def _extract_stream_from_secure_player(url):
         req = Request(url)
         for k, v in all_h.items():
             req.add_header(k, v)
-        req.add_header("Host", "player.appx.co.in")
+        req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36")
         req.add_header("Referer", "https://yodhaappapi.classx.co.in/")
 
         with urlopen(req, timeout=15) as resp:
@@ -483,7 +495,7 @@ def _extract_stream_from_secure_player(url):
             return mp4_matches[0]
 
         # Search for file: "..." or source: "..." or hls: "..."
-        source_matches = re.findall(r'(?:file|source|src|url|hls)\s*:\s*["\'](https?://[^"\']+)["\']', html, re.IGNORECASE)
+        source_matches = re.findall(r'(?:file|source|src|url|hls|video)\s*:\s*["\'](https?://[^"\']+)["\']', html, re.IGNORECASE)
         for src in source_matches:
             if not any(src.lower().endswith(ext) for ext in [".js", ".css", ".png", ".jpg"]):
                 print(f"[PLAYER] Found source match in JS: {src}")
@@ -756,9 +768,14 @@ async def _download_video(url, output_path, task_id):
         yt_bin = shutil.which("yt-dlp")
         ytdlp_base = [yt_bin] if yt_bin else [sys.executable, "-m", "yt_dlp"]
 
+        user_agent_val = all_headers.get("User-Agent") or HEADERS["User-Agent"]
+        referer_val = all_headers.get("Referer") or HEADERS["Referer"]
+
         ytdlp_cmd = ytdlp_base + [
             "--no-warnings",
             "--no-check-certificates",
+            "--user-agent", user_agent_val,
+            "--referer", referer_val,
             "-N", "16",
             "--concurrent-fragments", "16",
             "--hls-use-mpegts",
