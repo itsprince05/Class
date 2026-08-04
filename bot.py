@@ -329,7 +329,7 @@ async def download_video(url: str, output_path: str, task_id: str, quality: str 
     """Download video stream using yt-dlp."""
     try:
         url = decrypt_classx_url(url)
-        format_spec = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
+        format_spec = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best/b"
         
         cmd = [
             sys.executable, "-m", "yt_dlp",
@@ -348,7 +348,8 @@ async def download_video(url: str, output_path: str, task_id: str, quality: str 
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            limit=10 * 1024 * 1024  # 10 MB buffer limit to prevent 'chunk exceed the limit' error
         )
         active_processes[task_id] = process
         progress_data[task_id] = {"phase": "Downloading Video...", "current": 0, "total": 0}
@@ -361,7 +362,12 @@ async def download_video(url: str, output_path: str, task_id: str, quality: str 
                     pass
                 return False, "Cancelled by user"
                 
-            line = await process.stdout.readline()
+            try:
+                line = await process.stdout.readline()
+            except ValueError:
+                # Fallback if a single log line exceeds buffer size limit
+                line = await process.stdout.read(65536)
+                
             if not line:
                 break
             line_str = line.decode("utf-8", errors="ignore").strip()
