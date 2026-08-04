@@ -326,13 +326,14 @@ async def download_pdf(url: str, output_path: str, task_id: str) -> Tuple[bool, 
         return False, str(e)
 
 async def download_video(url: str, output_path: str, task_id: str, quality: str = "720") -> Tuple[bool, str]:
-    """Download video stream using yt-dlp."""
+    """Download video stream using yt-dlp with real-time disk monitoring."""
     try:
         url = decrypt_classx_url(url)
         format_spec = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best/b"
         
         cmd = [
             sys.executable, "-m", "yt_dlp",
+            "--newline",
             "--no-check-certificates",
             "--no-warnings",
             "--user-agent", HEADERS["User-Agent"],
@@ -352,43 +353,68 @@ async def download_video(url: str, output_path: str, task_id: str, quality: str 
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            limit=10 * 1024 * 1024  # 10 MB buffer limit to prevent 'chunk exceed the limit' error
+            limit=10 * 1024 * 1024  # 10 MB buffer limit
         )
         active_processes[task_id] = process
         progress_data[task_id] = {"phase": "Downloading Video...", "current": 0, "total": 0}
         
+        # Real-time disk size monitor fallback
+        async def monitor_disk_size():
+            out_file = Path(output_path)
+            parent_dir = out_file.parent
+            file_prefix = out_file.name
+            
+            while task_id in progress_data and process.returncode is None:
+                await asyncio.sleep(1)
+                try:
+                    current_bytes = 0
+                    if out_file.exists():
+                        current_bytes = out_file.stat().st_size
+                    else:
+                        for p in parent_dir.glob(f"{file_prefix}*"):
+                            current_bytes = max(current_bytes, p.stat().st_size)
+                            
+                    if current_bytes > 0 and task_id in progress_data:
+                        if progress_data[task_id]["current"] < current_bytes:
+                            progress_data[task_id]["current"] = current_bytes
+                except Exception:
+                    pass
+
+        disk_monitor = asyncio.create_task(monitor_disk_size())
+
         while True:
             if task_id in cancelled_tasks:
                 try:
                     process.kill()
                 except Exception:
                     pass
+                disk_monitor.cancel()
                 return False, "Cancelled by user"
                 
             try:
                 line = await process.stdout.readline()
             except ValueError:
-                # Fallback if a single log line exceeds buffer size limit
                 line = await process.stdout.read(65536)
                 
             if not line:
                 break
             line_str = line.decode("utf-8", errors="ignore").strip()
             
-            # Parse yt-dlp percentage lines
-            match = re.search(r'\[download\]\s+(\d+\.\d+)%\s+of\s+~?(\d+\.\d+)(\w+)', line_str)
+            # Parse yt-dlp percentage lines with --newline
+            match = re.search(r'\[download\]\s+(\d+\.?\d*)%\s+of\s+~?\s*(\d+\.?\d*)(\w+)', line_str)
             if match:
                 pct = float(match.group(1))
                 size_num = float(match.group(2))
                 unit = match.group(3).upper()
-                mult = 1024 * 1024 if "M" in unit else (1024 * 1024 * 1024 if "G" in unit else 1024)
+                mult = 1024 * 1024 if "M" in unit else (1024 * 1024 * 1024 if "G" in unit else (1024 if "K" in unit else 1))
                 total_b = int(size_num * mult)
                 curr_b = int((pct / 100.0) * total_b)
                 if task_id in progress_data:
                     progress_data[task_id]["total"] = total_b
-                    progress_data[task_id]["current"] = curr_b
+                    progress_data[task_id]["current"] = max(progress_data[task_id]["current"], curr_b)
 
         await process.wait()
+        disk_monitor.cancel()
         active_processes.pop(task_id, None)
         
         if process.returncode != 0:
