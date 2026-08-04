@@ -333,47 +333,60 @@ def _decrypt_classx_url(encrypted_str):
 def _find_url_in_dict(obj):
     """Recursively search for a video URL or decryptable string in any dict or list."""
     if isinstance(obj, dict):
-        priority_keys = [
-            "download_link", "video_url", "video_link", "encrypted_link",
-            "link", "url", "hls_url", "m3u8_url", "stream_url", "file_url",
-            "encrypted_link_360", "encrypted_link_480", "encrypted_link_720", "encrypted_link_1080",
-            "video_url_360", "video_url_480", "video_url_720", "video_url_1080",
-            "url_360", "url_480", "url_720", "url_1080", "path"
+        # 1. PRIORITY 1: Check encrypted fields FIRST (ClassX stores real AES m3u8 stream links here)
+        enc_keys = [
+            "encrypted_link", "encrypted_link_720", "encrypted_link_480", "encrypted_link_360",
+            "encrypted_link_1080", "encrypted_url", "enc_url"
         ]
-        for key in priority_keys:
-            if key in obj:
-                val = obj[key]
-                if isinstance(val, str) and val.strip():
-                    val = val.strip()
-                    if val.startswith("http"):
-                        return val
+        for key in enc_keys:
+            if key in obj and obj[key]:
+                val = str(obj[key]).strip()
+                if val:
                     dec = _decrypt_classx_url(val)
-                    if dec:
+                    if dec and dec.startswith("http"):
+                        print(f"[RESOLVE] Decrypted direct stream link from '{key}': {dec[:60]}...")
                         return dec
 
+        # 2. PRIORITY 2: Direct stream URL fields (.m3u8 / .mp4 / akamai / stream)
+        stream_keys = [
+            "hls_url", "m3u8_url", "stream_url", "video_url", "video_link",
+            "video_url_720", "video_url_480", "video_url_360", "video_url_1080",
+            "url_720", "url_480", "url_360", "url_1080", "path", "file_url"
+        ]
+        for key in stream_keys:
+            if key in obj and obj[key]:
+                val = str(obj[key]).strip()
+                # Skip template player links with empty token
+                if "secure-player" in val.lower() and val.lower().endswith("token="):
+                    continue
+                if val.startswith("http"):
+                    if any(ext in val.lower() for ext in [".m3u8", ".mp4", "akamai", "cdn", "hls"]):
+                        return val
+                    dec = _decrypt_classx_url(val)
+                    if dec and dec.startswith("http"):
+                        return dec
+
+        # 3. PRIORITY 3: Fallback fields (download_link, url, link)
+        for key in ["download_link", "url", "link"]:
+            if key in obj and obj[key]:
+                val = str(obj[key]).strip()
+                if "secure-player" in val.lower() and val.lower().endswith("token="):
+                    continue
+                if val.startswith("http"):
+                    dec = _decrypt_classx_url(val)
+                    if dec and dec.startswith("http"):
+                        return dec
+                    if not val.lower().endswith("token="):
+                        return val
+
+        # 4. PRIORITY 4: Recursive search in sub-dictionaries / lists
         for k, v in obj.items():
             if k in ["lecture_summary_url", "image", "thumbnail", "photo", "icon", "banner"]:
                 continue
-
-            if isinstance(v, str) and v.strip():
-                v = v.strip()
-                if v.startswith("http"):
-                    if any(ext in v.lower() for ext in [".m3u8", ".mp4", "stream", "video", "hls", "akamai", "cdn", "appx"]):
-                        return v
-                else:
-                    dec = _decrypt_classx_url(v)
-                    if dec:
-                        return dec
-            elif isinstance(v, (dict, list)):
+            if isinstance(v, (dict, list)):
                 res = _find_url_in_dict(v)
                 if res:
                     return res
-
-        for k, v in obj.items():
-            if k in ["lecture_summary_url", "image", "thumbnail", "photo", "icon", "banner"]:
-                continue
-            if isinstance(v, str) and v.startswith("http") and not any(v.lower().endswith(img_ext) for img_ext in [".png", ".jpg", ".jpeg", ".webp"]):
-                return v
 
     elif isinstance(obj, list):
         for item in obj:
