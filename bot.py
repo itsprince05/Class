@@ -149,14 +149,14 @@ def decrypt_classx_url(encrypted_str: str) -> str:
     return encrypted_str
 
 def format_bytes(size: int) -> str:
-    """Format size in bytes to human readable string."""
+    """Format size in bytes to human readable string with 2 decimal places."""
     if size <= 0:
-        return "0 B"
+        return "0.00 B"
     units = ["B", "KB", "MB", "GB", "TB"]
     i = int(math.floor(math.log(size, 1024)))
     p = math.pow(1024, i)
     s = round(size / p, 2)
-    return f"{s} {units[i]}"
+    return f"{s:.2f} {units[i]}"
 
 def get_readable_time(seconds: int) -> str:
     """Format seconds into HH:MM:SS string."""
@@ -174,8 +174,8 @@ def get_readable_time(seconds: int) -> str:
 # Progress Loop Updater
 # ---------------------------------------------------------------------------
 
-async def _progress_loop(status_msg: Message, task_id: str, title: str = ""):
-    """Background task updating message progress in real-time."""
+async def _progress_loop(status_msg: Message, task_id: str, title: str = "", is_pdf: bool = False):
+    """Background task updating message progress in real-time with custom layout."""
     start_time = time.time()
     last_update = 0
     
@@ -185,32 +185,31 @@ async def _progress_loop(status_msg: Message, task_id: str, title: str = ""):
             break
             
         data = progress_data.get(task_id, {})
-        phase = data.get("phase", "Processing...")
+        phase = data.get("phase", "Downloading")
         current = data.get("current", 0)
         total = data.get("total", 0)
         
         now = time.time()
         elapsed = now - start_time
         
+        media_type = "PDF" if is_pdf else "Video"
+        header = f"{phase} {media_type}..."
+        
         if total > 0:
-            pct = (current / total) * 100
             speed = current / elapsed if elapsed > 0 else 0
-            eta = (total - current) / speed if speed > 0 else 0
-            
             text = (
-                f"📥 **{title or 'Processing File'}**\n\n"
-                f"⚙️ **Status:** {phase}\n"
-                f"📊 **Progress:** {pct:.1f}%\n"
-                f"💾 **Size:** {format_bytes(current)} / {format_bytes(total)}\n"
-                f"🚀 **Speed:** {format_bytes(int(speed))}/s | ⏳ **ETA:** {get_readable_time(int(eta))}"
+                f"{header}\n"
+                f"{title}\n\n"
+                f"{format_bytes(current)} / {format_bytes(total)}\n"
+                f"Speed: {format_bytes(int(speed))}/s"
             )
         else:
             speed = current / elapsed if elapsed > 0 else 0
             text = (
-                f"📥 **{title or 'Processing File'}**\n\n"
-                f"⚙️ **Status:** {phase}\n"
-                f"💾 **Processed:** {format_bytes(current)}\n"
-                f"🚀 **Speed:** {format_bytes(int(speed))}/s | ⏱️ **Elapsed:** {get_readable_time(int(elapsed))}"
+                f"{header}\n"
+                f"{title}\n\n"
+                f"{format_bytes(current)}\n"
+                f"Speed: {format_bytes(int(speed))}/s"
             )
             
         if now - last_update >= 3:
@@ -218,7 +217,7 @@ async def _progress_loop(status_msg: Message, task_id: str, title: str = ""):
                 await status_msg.edit_text(
                     text,
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⛔ Cancel / Stop", callback_data=f"cancel_{task_id}")]
+                        [InlineKeyboardButton("⛔ Stop", callback_data=f"cancel_{task_id}")]
                     ])
                 )
                 last_update = now
@@ -737,8 +736,8 @@ async def process_single_item(client: Client, chat_id: int, item: Dict[str, Any]
     output_path = str(DOWNLOAD_DIR / f"{task_id}{ext}")
     
     status_msg = await client.send_message(chat_id, f"⌛ **Starting download for:** `{name}`")
-    progress_data[task_id] = {"phase": "Initializing...", "current": 0, "total": 0}
-    updater = asyncio.create_task(_progress_loop(status_msg, task_id, title=name))
+    progress_data[task_id] = {"phase": "Downloading", "current": 0, "total": 0}
+    updater = asyncio.create_task(_progress_loop(status_msg, task_id, title=name, is_pdf=is_pdf))
     
     try:
         if is_pdf:
@@ -759,7 +758,7 @@ async def process_single_item(client: Client, chat_id: int, item: Dict[str, Any]
             return
             
         file_size = os.path.getsize(output_path)
-        progress_data[task_id] = {"phase": "Uploading to Telegram...", "current": 0, "total": file_size}
+        progress_data[task_id] = {"phase": "Uploading", "current": 0, "total": file_size}
         
         async def upload_prog(current, total, t_id):
             if t_id in progress_data:
