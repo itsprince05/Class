@@ -49,6 +49,7 @@ import random
 import base64
 from pathlib import Path
 from urllib.request import Request, urlopen
+from collections import deque
 from typing import Union, Dict, Any, Tuple, List
 
 from pyrogram import Client, filters
@@ -70,6 +71,16 @@ cancelled_tasks = set()
 active_processes = {}
 user_states = {}
 progress_data = {}
+
+def _cleanup_stale_user_states():
+    """Prune user states older than 15 minutes to prevent RAM leak from abandoned setups."""
+    now = time.time()
+    stale_users = [
+        u for u, s in user_states.items()
+        if now - s.get("created_at", now) > 900
+    ]
+    for u in stale_users:
+        user_states.pop(u, None)
 
 # ---------------------------------------------------------------------------
 # Configuration & Setup
@@ -105,6 +116,24 @@ app = Client(
     bot_token=BOT_TOKEN,
     workdir=str(BASE_DIR),
 )
+
+from urllib.parse import urlparse, unquote
+
+def extract_name_from_url(url: str, default_index: int = 1) -> str:
+    """Extract a clean title from a URL path or default to a clean lesson name."""
+    try:
+        url = decrypt_classx_url(url)
+        path = urlparse(url).path
+        filename = Path(path).name
+        if filename:
+            clean_name = re.sub(r'\.(pdf|m3u8|mp4|ts|mkv|webm)$', '', filename, flags=re.IGNORECASE)
+            clean_name = unquote(clean_name).replace('_', ' ').replace('-', ' ').strip()
+            # Ignore generic technical terms or random master/index names
+            if clean_name and len(clean_name) > 3 and clean_name.lower() not in ["master", "index", "playlist", "video", "file"]:
+                return clean_name
+    except Exception:
+        pass
+    return f"Lesson {default_index}"
 
 # ---------------------------------------------------------------------------
 # Helper Utility Functions
@@ -258,6 +287,7 @@ async def download_pdf(url: str, output_path: str, task_id: str) -> Tuple[bool, 
 
 async def download_video(url: str, output_path: str, task_id: str, quality: str = "720") -> Tuple[bool, str]:
     """Download video stream using yt-dlp with real-time disk monitoring."""
+    disk_monitor = None
     try:
         url = decrypt_classx_url(url)
         format_spec = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best/b"
@@ -283,13 +313,13 @@ async def download_video(url: str, output_path: str, task_id: str, quality: str 
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,  # Combine stderr into stdout to prevent pipe buffer deadlock
+            stderr=asyncio.subprocess.STDOUT,
             limit=10 * 1024 * 1024
         )
         active_processes[task_id] = process
         progress_data[task_id] = {"phase": "Downloading", "current": 0, "total": 0}
         
-        output_logs = []
+        output_logs = deque(maxlen=50)  # Fixed size buffer to prevent memory leak from unconstrained log growth
 
         # Real-time disk size monitor fallback
         async def monitor_disk_size():
@@ -321,7 +351,6 @@ async def download_video(url: str, output_path: str, task_id: str, quality: str 
                     process.kill()
                 except Exception:
                     pass
-                disk_monitor.cancel()
                 return False, "Cancelled by user"
                 
             try:
@@ -349,17 +378,18 @@ async def download_video(url: str, output_path: str, task_id: str, quality: str 
                     progress_data[task_id]["current"] = max(progress_data[task_id]["current"], curr_b)
 
         await process.wait()
-        disk_monitor.cancel()
-        active_processes.pop(task_id, None)
         
         if process.returncode != 0:
-            err_log = "\n".join(output_logs[-20:])
+            err_log = "\n".join(output_logs)
             return False, err_log or "yt-dlp video download failed"
             
         return True, ""
     except Exception as e:
-        active_processes.pop(task_id, None)
         return False, str(e)
+    finally:
+        active_processes.pop(task_id, None)
+        if disk_monitor and not disk_monitor.done():
+            disk_monitor.cancel()
 
 # ---------------------------------------------------------------------------
 # Video Metadata & Thumbnail Generators
@@ -417,6 +447,7 @@ def generate_thumbnail(video_path: str, thumb_path: str) -> str:
 @app.on_message(filters.command("start"))
 async def start_cmd(client: Client, message: Message):
     """Start command handler."""
+    _cleanup_stale_user_states()
     user = message.from_user
     mention = user.mention if user else "User"
     welcome_text = (
@@ -444,6 +475,7 @@ async def start_cmd(client: Client, message: Message):
 @app.on_message(filters.command(["update", "upate"]))
 async def update_cmd(client: Client, message: Message):
     """Update command handler to pull code, upgrade yt-dlp, and restart."""
+    _cleanup_stale_user_states()
     if OWNER_ID and message.from_user.id != OWNER_ID:
         await message.reply_text("Only the bot owner can execute /update command.")
         return
@@ -475,6 +507,7 @@ async def update_cmd(client: Client, message: Message):
 @app.on_message(filters.command(["stop", "cancel"]))
 async def cancel_cmd(client: Client, message: Message):
     """Cancel ongoing download tasks."""
+    _cleanup_stale_user_states()
     user_id = message.from_user.id
     if user_id in user_states:
         user_states.pop(user_id, None)
@@ -502,6 +535,7 @@ async def cancel_cmd(client: Client, message: Message):
 
 @app.on_callback_query()
 async def callback_handler(client: Client, query: CallbackQuery):
+    _cleanup_stale_user_states()
     data = query.data
     user_id = query.from_user.id
     
@@ -513,6 +547,7 @@ async def callback_handler(client: Client, query: CallbackQuery):
             "  Document Title : https://example.com/file.pdf\n\n"
             "• Single Download: Send any direct PDF or Video link in chat.\n"
             "• Supported Types: PDF documents & Video streams.\n"
+            "• Edit Caption: Reply to any uploaded Video or PDF with any text to edit its caption.\n"
             "• Cancel: Click Stop on progress card or send /stop."
         )
         buttons = InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="start_menu")]])
@@ -580,142 +615,47 @@ async def callback_handler(client: Client, query: CallbackQuery):
 # Message Handlers (Documents / TXT & Links)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Message Handlers (Direct Link & Caption Edit)
+# ---------------------------------------------------------------------------
+
 @app.on_message(filters.document)
 async def document_handler(client: Client, message: Message):
-    doc = message.document
-    if not doc.file_name.endswith(".txt"):
-        await message.reply_text("Please send a .txt file containing PDF or Video links.")
-        return
-        
-    status_msg = await message.reply_text("Reading TXT file...")
-    txt_path = await message.download(file_name=str(DOWNLOAD_DIR / f"{message.id}.txt"))
-    
-    with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
-        lines = [l.strip() for l in f.readlines() if l.strip()]
-        
-    try:
-        os.remove(txt_path)
-    except OSError:
-        pass
-        
-    if not lines:
-        await status_msg.edit_text("The uploaded TXT file is empty.")
-        return
-        
-    items = []
-    for idx, line in enumerate(lines, 1):
-        if ":" in line and not line.startswith("http"):
-            parts = line.split(":", 1)
-            name = parts[0].strip()
-            url = parts[1].strip()
-        else:
-            name = f"File {idx}"
-            url = line.strip()
-            
-        if url.startswith("http") or url.startswith("https") or ":" in url:
-            items.append({"index": idx, "name": name, "url": url})
-            
-    if not items:
-        await status_msg.edit_text("No valid links found in the uploaded file.")
-        return
-        
-    user_id = message.from_user.id
-    user_states[user_id] = {
-        "chat_id": message.chat.id,
-        "items": items,
-        "total": len(items),
-        "step": "awaiting_range"
-    }
-    
-    await status_msg.edit_text(
-        f"Found {len(items)} links in file.\n\n"
-        f"Send the start & end range in format start-end or single number.\n"
-        f"Example: 1-{len(items)} or 1-10"
-    )
+    await message.reply_text("Please send a direct PDF or Video URL in chat.")
 
 @app.on_message(filters.text & ~filters.command(["start", "update", "upate", "stop", "cancel"]))
 async def text_handler(client: Client, message: Message):
-    user_id = message.from_user.id
-    state = user_states.get(user_id)
     text = message.text.strip()
     
-    # 1. Range Selection State
-    if state and state.get("step") == "awaiting_range":
-        items = state["items"]
-        total = state["total"]
+    # 0. Reply Handler: Edit Caption of Video or PDF message sent by bot
+    if message.reply_to_message:
+        replied_msg = message.reply_to_message
+        if replied_msg.from_user and replied_msg.from_user.is_self:
+            if replied_msg.video or replied_msg.document:
+                try:
+                    await client.edit_message_caption(
+                        chat_id=message.chat.id,
+                        message_id=replied_msg.id,
+                        caption=text
+                    )
+                    await message.reply_text("Caption updated successfully.")
+                    return
+                except Exception as e:
+                    await message.reply_text(f"Failed to update caption: {e}")
+                    return
+
+    # 1. Single Direct Link Input
+    if ":" in text and not text.startswith("http"):
+        parts = text.split(":", 1)
+        name = parts[0].strip()
+        url = parts[1].strip()
+    else:
+        url = text
+        name = extract_name_from_url(url, 1)
         
-        start_idx = 1
-        end_idx = total
-        
-        if "-" in text:
-            try:
-                p = text.split("-")
-                start_idx = int(p[0].strip())
-                end_idx = int(p[1].strip())
-            except ValueError:
-                await message.reply_text(f"Invalid range format. Send like 1-{total}.")
-                return
-        else:
-            try:
-                start_idx = int(text)
-                end_idx = total
-            except ValueError:
-                await message.reply_text(f"Invalid range number. Send like 1-{total}.")
-                return
-                
-        start_idx = max(1, min(start_idx, total))
-        end_idx = max(start_idx, min(end_idx, total))
-        
-        selected_items = items[start_idx-1:end_idx]
-        state["selected_items"] = selected_items
-        state["step"] = "awaiting_quality"
-        
-        quality_markup = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("360p", callback_data="res_360"),
-                InlineKeyboardButton("480p", callback_data="res_480")
-            ],
-            [
-                InlineKeyboardButton("720p", callback_data="res_720"),
-                InlineKeyboardButton("1080p", callback_data="res_1080")
-            ]
-        ])
-        await message.reply_text(
-            f"Selected Range: {start_idx} to {end_idx} ({len(selected_items)} items)\n\n"
-            f"Select Video Resolution:",
-            reply_markup=quality_markup
-        )
-        return
-        
-    # 2. Direct Link Input (Single or Multi-line links)
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    valid_items = []
-    
-    for idx, line in enumerate(lines, 1):
-        if ":" in line and not line.startswith("http"):
-            parts = line.split(":", 1)
-            name = parts[0].strip()
-            url = parts[1].strip()
-        else:
-            name = f"File_{int(time.time())}_{idx}"
-            url = line
-            
-        if url.startswith("http://") or url.startswith("https://") or ":" in url:
-            valid_items.append({"index": idx, "name": name, "url": url})
-            
-    if valid_items:
-        if len(valid_items) == 1:
-            # Single link: start processing immediately!
-            asyncio.create_task(process_single_item(client, message.chat.id, valid_items[0], quality="720"))
-        else:
-            # Multi-line links sent in text: process batch directly!
-            state = {
-                "chat_id": message.chat.id,
-                "selected_items": valid_items,
-                "quality": "720"
-            }
-            asyncio.create_task(run_batch_download(client, message, state))
-        return
+    if url.startswith("http://") or url.startswith("https://") or ":" in url:
+        item = {"index": 1, "name": name, "url": url}
+        asyncio.create_task(process_single_item(client, message.chat.id, item, quality="720"))
     else:
         await message.reply_text("Please send a valid PDF or Video URL.")
 
@@ -747,14 +687,10 @@ async def process_single_item(client: Client, chat_id: int, item: Dict[str, Any]
             success, err = await download_video(url, output_path, task_id, quality=quality)
             
         if not success:
-            progress_data.pop(task_id, None)
-            updater.cancel()
             await status_msg.edit_text(f"Download Failed: {name}\n\n{err[:1000]}")
             return
             
         if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            progress_data.pop(task_id, None)
-            updater.cancel()
             await status_msg.edit_text("Error: Downloaded file is empty.")
             return
             
@@ -764,6 +700,7 @@ async def process_single_item(client: Client, chat_id: int, item: Dict[str, Any]
         async def upload_prog(current, total, t_id):
             if t_id in progress_data:
                 progress_data[t_id]["current"] = current
+                progress_data[t_id]["total"] = total
                 
         if is_pdf:
             await client.send_document(
@@ -800,43 +737,50 @@ async def process_single_item(client: Client, chat_id: int, item: Dict[str, Any]
                     except OSError:
                         pass
 
-        progress_data.pop(task_id, None)
-        updater.cancel()
-        
         try:
             await status_msg.delete()
         except Exception:
             pass
 
     except Exception as e:
-        progress_data.pop(task_id, None)
-        updater.cancel()
         await status_msg.edit_text(f"Error processing {name}:\n{e}")
     finally:
-        if os.path.exists(output_path):
-            try:
-                os.remove(output_path)
-            except OSError:
-                pass
-
-async def run_batch_download(client: Client, message: Message, state: Dict[str, Any]):
-    """Run batch download loop for selected items."""
-    chat_id = state["chat_id"]
-    items = state["selected_items"]
-    quality = state.get("quality", "720")
-    total = len(items)
-    
-    summary_msg = await client.send_message(chat_id, f"Starting Batch Processing ({total} items)...")
-    
-    for i, item in enumerate(items, 1):
-        if any(task.startswith(str(chat_id)) for task in cancelled_tasks):
-            await client.send_message(chat_id, "Batch download cancelled by user.")
-            break
+        progress_data.pop(task_id, None)
+        cancelled_tasks.discard(task_id)
+        if updater and not updater.done():
+            updater.cancel()
             
-        await process_single_item(client, chat_id, item, quality=quality)
-        await asyncio.sleep(1)
-        
-    await summary_msg.edit_text(f"Batch Completed! Processed {total} item(s).")
+        # Clean up all matching download files (including .part, .ytdl, .jpg)
+        try:
+            for p in DOWNLOAD_DIR.glob(f"{task_id}*"):
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+
+# ---------------------------------------------------------------------------
+# Restart Notification & Entry Point
+# ---------------------------------------------------------------------------
+
+@app.on_message(group=-1)
+async def check_restart_notification(client: Client, message: Message):
+    if RESTART_FILE.exists():
+        try:
+            RESTART_FILE.unlink()
+        except Exception as e:
+            print(f"[RESTART] Notification error: {e}")
+    message.continue_propagation()
+
+if __name__ == "__main__":
+    if not BOT_TOKEN or not API_ID or not API_HASH:
+        print("ERROR: BOT_TOKEN, API_ID, or API_HASH missing from .env")
+        sys.exit(1)
+
+    print("Bot started successfully. Listening for commands...")
+    app.run()
 
 # ---------------------------------------------------------------------------
 # Restart Notification & Entry Point
