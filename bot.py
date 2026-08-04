@@ -331,41 +331,68 @@ def _decrypt_classx_url(encrypted_str):
     return ""
 
 def _resolve_video_url(item_data, course_id):
-    """Extract or fetch video URL for a given item."""
+    """Extract or fetch video URL for a given item.
+
+    Returns (url: str, error_msg: str).
+    """
+    direct_fields = [
+        "download_link", "video_link", "link", "url", "hls_url", "m3u8_url",
+        "encrypted_link", "encrypted_link_360", "encrypted_link_480", "encrypted_link_720", "encrypted_link_1080"
+    ]
+
     # 1. Check direct fields on item
-    for field in ["download_link", "video_link", "link", "url", "hls_url", "m3u8_url"]:
+    for field in direct_fields:
         val = item_data.get(field, "")
-        if val and val.startswith("http"):
-            return val
-        if val:
-            dec = _decrypt_classx_url(val)
-            if dec:
-                return dec
+        if not val:
+            continue
+        if str(val).startswith("http"):
+            return str(val), ""
+        dec = _decrypt_classx_url(str(val))
+        if dec:
+            return dec, ""
 
     # 2. Fetch video details via API if ID exists
     video_id = item_data.get("id") or item_data.get("video_id")
     if not video_id:
-        return ""
+        keys_found = list(item_data.keys())
+        return "", f"No video ID in item (keys: {keys_found[:5]})"
 
     try:
         details = _get_video_details(course_id, video_id)
-        if details.get("status") == 200:
-            ddata = details.get("data", {})
-            if isinstance(ddata, list) and ddata:
-                ddata = ddata[0]
-            if isinstance(ddata, dict):
-                for field in ["download_link", "video_link", "link", "url", "hls_url", "encrypted_link", "encrypted_link_360"]:
-                    val = ddata.get(field, "")
-                    if val and val.startswith("http"):
-                        return val
-                    if val:
-                        dec = _decrypt_classx_url(val)
-                        if dec:
-                            return dec
-    except Exception as e:
-        print(f"[BATCH] Error fetching video details for ID {video_id}: {e}")
+        if not isinstance(details, dict):
+            return "", f"Invalid API response type: {type(details)}"
 
-    return ""
+        status = details.get("status")
+        msg = details.get("message", "")
+        if status != 200:
+            return "", f"API Error status {status}: {msg}"
+
+        ddata = details.get("data", {})
+        if isinstance(ddata, list) and ddata:
+            ddata = ddata[0]
+
+        if isinstance(ddata, dict):
+            for field in direct_fields:
+                val = ddata.get(field, "")
+                if not val:
+                    continue
+                if str(val).startswith("http"):
+                    return str(val), ""
+                dec = _decrypt_classx_url(str(val))
+                if dec:
+                    return dec, ""
+
+            avail_keys = list(ddata.keys())
+            return "", f"No video link in API response (keys: {avail_keys[:8]})"
+        else:
+            return "", f"API data empty or invalid: {type(ddata)}"
+
+    except HTTPError as e:
+        return "", f"HTTP {e.code}: {e.reason}"
+    except URLError as e:
+        return "", f"URL Error: {e.reason}"
+    except Exception as e:
+        return "", f"API Exception: {str(e)}"
 
 def _resolve_pdf_urls(item_data):
     """Extract PDF URLs from item data."""
@@ -839,11 +866,12 @@ async def handle_batch(client, message):
     # Step 2: Process each item
     success_count = 0
     fail_count = 0
+    failed_reasons = []
 
     for idx, item in enumerate(items, 1):
-        title = item.get("Title", f"Item {idx}")
-        item_id = item.get("id")
-        material_type = item.get("material_type", "")
+        title = item.get("Title") or item.get("title") or f"Item {idx}"
+        item_id = item.get("id") or item.get("video_id")
+        material_type = item.get("material_type") or item.get("type", "")
 
         try:
             await status_msg.edit_text(f"Processing {idx}/{total}...\n\nTitle: {title}")
@@ -879,6 +907,7 @@ async def handle_batch(client, message):
                     progress_data.pop(task_id, None)
                     updater.cancel()
                     fail_count += 1
+                    failed_reasons.append(f"PDF '{pdf_label}': Download failed - {err[:150]}")
                     try:
                         await status_msg.edit_text(f"PDF download failed for {pdf_label}:\n{err}")
                         await asyncio.sleep(3)
@@ -908,6 +937,7 @@ async def handle_batch(client, message):
 
             except Exception as e:
                 fail_count += 1
+                failed_reasons.append(f"PDF '{title}': Error - {str(e)[:150]}")
                 try:
                     await status_msg.edit_text(f"Error processing PDF {pdf_label}:\n{e}")
                     await asyncio.sleep(3)
@@ -923,11 +953,12 @@ async def handle_batch(client, message):
         # --- Handle Videos ---
         is_video_item = (material_type == "VIDEO") or bool(item.get("video_id")) or (not pdf_urls and material_type != "PDF")
         if is_video_item:
-            video_url = await asyncio.to_thread(_resolve_video_url, item, course_id)
+            video_url, resolve_err = await asyncio.to_thread(_resolve_video_url, item, course_id)
             if not video_url:
-                print(f"[BATCH] No video URL found for item {item_id}: {title}")
+                print(f"[BATCH] No video URL found for item {item_id}: {title} ({resolve_err})")
                 if not pdf_urls:
                     fail_count += 1
+                    failed_reasons.append(f"Video '{title}': {resolve_err}")
                 continue
 
             try:
@@ -949,6 +980,7 @@ async def handle_batch(client, message):
                     progress_data.pop(task_id, None)
                     updater.cancel()
                     fail_count += 1
+                    failed_reasons.append(f"Video '{title}': Download failed - {err[:150]}")
                     try:
                         await status_msg.edit_text(f"Video download failed for {vid_label}:\n{err[:300]}")
                         await asyncio.sleep(3)
@@ -979,6 +1011,7 @@ async def handle_batch(client, message):
 
             except Exception as e:
                 fail_count += 1
+                failed_reasons.append(f"Video '{title}': Exception - {str(e)[:150]}")
                 try:
                     await status_msg.edit_text(f"Error processing video {vid_label}:\n{e}")
                     await asyncio.sleep(3)
@@ -992,13 +1025,20 @@ async def handle_batch(client, message):
                     pass
 
     # Final summary
+    summary = (
+        f"Batch complete...\n\n"
+        f"Total: {total}\n"
+        f"Done: {success_count}\n"
+        f"Failed: {fail_count}"
+    )
+    if failed_reasons:
+        summary += "\n\nFailures detail:\n" + "\n".join(f"• {r}" for r in failed_reasons)
+
+    if len(summary) > 4000:
+        summary = summary[:3900] + "\n\n...[truncated]"
+
     try:
-        await status_msg.edit_text(
-            f"Batch complete...\n\n"
-            f"Total: {total}\n"
-            f"Done: {success_count}\n"
-            f"Failed: {fail_count}"
-        )
+        await status_msg.edit_text(summary)
     except Exception:
         pass
 
