@@ -1,14 +1,14 @@
 import os
 import sys
-import subprocess
 import shutil
+import subprocess
 
 # ---------------------------------------------------------------------------
 # Auto-install missing dependencies
 # ---------------------------------------------------------------------------
 
 def _ensure_deps():
-    """Install missing Python packages and check CLI tools at startup."""
+    """Install missing Python packages and update yt-dlp at startup."""
     packages = {
         "pyrogram": "pyrogram",
         "tgcrypto": "tgcrypto",
@@ -24,62 +24,54 @@ def _ensure_deps():
             missing.append(pip_name)
 
     if missing:
-        print(f"[SETUP] Installing: {', '.join(missing)}")
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet"] + missing
-        )
-        print(f"[SETUP] Installed successfully")
+        print(f"[SETUP] Installing missing packages: {', '.join(missing)}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet"] + missing)
+        print("[SETUP] Package installation complete.")
 
-    # Check CLI tools
-    if not shutil.which("ffmpeg"):
-        print("[SETUP] WARNING: ffmpeg not found in PATH. Install it:")
-        print("  Ubuntu/Debian: sudo apt install ffmpeg")
-        print("  CentOS/RHEL:   sudo yum install ffmpeg")
-
-    print("[SETUP] Ensuring yt-dlp is up-to-date...")
     try:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", "yt-dlp"]
-        )
+        print("[SETUP] Upgrading yt-dlp to latest release...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", "yt-dlp"])
     except Exception as e:
         print(f"[SETUP] yt-dlp check warning: {e}")
 
 _ensure_deps()
 
 # ---------------------------------------------------------------------------
-# Imports (safe to import now, deps are installed)
+# Core Imports
 # ---------------------------------------------------------------------------
 
 import asyncio
 import re
 import time
+import json
+import math
+import random
 import base64
-import gzip
-from io import BytesIO
-from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+from typing import Union, Dict, Any, Tuple, List
 
-from pyrogram import Client, filters, idle
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram import Client, filters
+from pyrogram.types import (
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+)
 from pyrogram.errors import FloodWait
+from pyrogram.raw.types import InputFileBig, InputFile
+from pyrogram.raw.functions.upload import SaveBigFilePart
 from dotenv import load_dotenv
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 
-import math
-import random
-from pyrogram.client import Client
-from pyrogram.raw.types import InputFileBig, InputFile
-from pyrogram.raw.functions.upload import SaveBigFilePart, SaveFilePart
-from typing import Union
-
 # ---------------------------------------------------------------------------
-# Monkey Patch Pyrogram Fast Uploader
+# Pyrogram Fast Uploader (Parallel Multi-chunk Uploader)
 # ---------------------------------------------------------------------------
 
 original_save_file = Client.save_file
+
+cancelled_tasks = set()
+active_processes = {}
+user_states = {}
+progress_data = {}
 
 async def fast_save_file(self: Client, *args, **kwargs) -> Union[InputFile, InputFileBig]:
     path = kwargs.get("path")
@@ -87,21 +79,17 @@ async def fast_save_file(self: Client, *args, **kwargs) -> Union[InputFile, Inpu
         path = args[0]
         
     file_size = os.path.getsize(path)
-        
-    # Extract other arguments if passed
     file_id = kwargs.get("file_id")
-    file_part = kwargs.get("file_part", 0)
     progress = kwargs.get("progress")
     progress_args = kwargs.get("progress_args", ())
     
-    part_size = 1024 * 1024  # 1 MB chunk size for high-speed VPS
+    part_size = 1024 * 1024  # 1 MB chunk size
     total_parts = math.ceil(file_size / part_size)
     if file_id is None:
         file_id = random.getrandbits(63)
         
-    sem = asyncio.Semaphore(20)  # 20 concurrent parallel upload connections
+    sem = asyncio.Semaphore(15)  # 15 concurrent upload connections
     uploaded_bytes = 0
-    
     task_id = progress_args[0] if progress_args else None
     
     async def upload_part(part_index):
@@ -123,16 +111,16 @@ async def fast_save_file(self: Client, *args, **kwargs) -> Union[InputFile, Inpu
                 bytes=chunk
             )
             
-            for attempt in range(10):  # 10 retries per chunk
+            for _ in range(5):
                 try:
                     await self.invoke(rpc)
                     break
                 except FloodWait as e:
                     await asyncio.sleep(e.value + 1)
-                except Exception as e:
-                    await asyncio.sleep(3)
+                except Exception:
+                    await asyncio.sleep(2)
             else:
-                raise Exception(f"Failed to upload part {part_index}")
+                raise Exception(f"Failed uploading part {part_index}")
                 
             uploaded_bytes += len(chunk)
             if progress:
@@ -141,7 +129,6 @@ async def fast_save_file(self: Client, *args, **kwargs) -> Union[InputFile, Inpu
                 else:
                     progress(uploaded_bytes, file_size, *progress_args)
 
-    # Launch all chunk upload tasks concurrently
     tasks = [asyncio.create_task(upload_part(i)) for i in range(total_parts)]
     await asyncio.gather(*tasks)
 
@@ -151,42 +138,37 @@ async def fast_save_file(self: Client, *args, **kwargs) -> Union[InputFile, Inpu
         name=Path(path).name
     )
 
-# Inject the fast uploader into Pyrogram's Client
 Client.save_file = fast_save_file
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration & Setup
 # ---------------------------------------------------------------------------
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-OWNER_ID = int(os.getenv("OWNER_ID"))
-OWNER_GROUP = int(os.getenv("OWNER_GROUP"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "").strip()
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+OWNER_GROUP = int(os.getenv("OWNER_GROUP", "0"))
 
 BASE_DIR = Path(__file__).parent.resolve()
 DOWNLOAD_DIR = BASE_DIR / "downloads"
+RESTART_FILE = BASE_DIR / "restart.json"
 
-# Clean up stale downloads from previous runs (e.g., if interrupted by /update)
-import shutil
 if DOWNLOAD_DIR.exists():
     shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/116.0.0.0 Safari/537.36",
     "Referer": "https://appx-play.akamai.net.in/",
     "Origin": "https://appx-play.akamai.net.in",
     "x-requested-with": "mark.via.gp"
 }
 
 app = Client(
-    "bot_session",
+    "pdf_video_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
@@ -194,171 +176,34 @@ app = Client(
 )
 
 # ---------------------------------------------------------------------------
-# Shared progress state  (task_id -> dict with phase/current/total)
-# Updated by download monitor & upload callback, read by progress updater.
+# Helper Utility Functions
 # ---------------------------------------------------------------------------
 
-progress_data = {}
-cancelled_tasks = set()
-active_processes = {}
+def is_pdf_url(url: str) -> bool:
+    """Check if URL points to a PDF document."""
+    url_lower = url.lower()
+    return ".pdf" in url_lower or "pdf" in url_lower
 
-# ---------------------------------------------------------------------------
-# Custom headers (loaded from headers.json, set via /setheaders)
-# ---------------------------------------------------------------------------
-
-import json
-
-HEADERS_FILE = BASE_DIR / "headers.json"
-custom_headers = {}
-
-def _load_custom_headers():
-    global custom_headers
-    if HEADERS_FILE.exists():
-        try:
-            custom_headers = json.loads(HEADERS_FILE.read_text())
-            print(f"[SETUP] Loaded {len(custom_headers)} custom headers")
-        except Exception:
-            custom_headers = {}
-
-def _save_custom_headers():
-    HEADERS_FILE.write_text(json.dumps(custom_headers, indent=2))
-
-def _get_all_headers():
-    """Merge default HEADERS with custom_headers. Custom headers override defaults."""
-    merged = dict(HEADERS)
-    merged.update(custom_headers)
-    return merged
-
-_load_custom_headers()
-
-# ---------------------------------------------------------------------------
-# API config (loaded from api_config.json, set via /setapi)
-# ---------------------------------------------------------------------------
-
-API_CONFIG_FILE = BASE_DIR / "api_config.json"
-api_config = {
-    "authorization": os.getenv("CLASSX_AUTH", ""),
-    "user-id": os.getenv("CLASSX_USER_ID", ""),
-    "x-device-id": os.getenv("CLASSX_DEVICE_ID", "20f953f4c295fe94"),
-    "course-id": os.getenv("CLASSX_COURSE_ID", "130"),
-}
-
-def _load_api_config():
-    global api_config
-    if API_CONFIG_FILE.exists():
-        try:
-            api_config = json.loads(API_CONFIG_FILE.read_text())
-            print(f"[SETUP] Loaded API config (user-id: {api_config.get('user-id', 'N/A')})")
-        except Exception:
-            api_config = {}
-
-def _save_api_config():
-    API_CONFIG_FILE.write_text(json.dumps(api_config, indent=2))
-
-_load_api_config()
-
-# ---------------------------------------------------------------------------
-# ClassX API helpers
-# ---------------------------------------------------------------------------
-
-CLASSX_API_BASE = "https://yodhaappapi.classx.co.in"
-
-def _get_api_headers():
-    """Build headers for ClassX API calls."""
-    return {
-        "Host": "yodhaappapi.classx.co.in",
-        "client-service": "Appx",
-        "auth-key": "appxapi",
-        "user-id": api_config.get("user-id", ""),
-        "authorization": api_config.get("authorization", ""),
-        "user-app-category": "",
-        "language": "en",
-        "x-tenant-app-version": "132",
-        "device-type": "ANDROID",
-        "x-device-id": api_config.get("x-device-id", "20f953f4c295fe94"),
-        "accept-encoding": "gzip",
-        "user-agent": "okhttp/5.3.2",
-    }
-
-def _api_get(url):
-    """Make a GET request to ClassX API and return JSON."""
-    headers = _get_api_headers()
-    req = Request(url)
-    for k, v in headers.items():
-        req.add_header(k, v)
-
-    with urlopen(req, timeout=30) as resp:
-        raw = resp.read()
-        # Handle gzip response
-        if resp.headers.get("Content-Encoding") == "gzip":
-            raw = gzip.decompress(raw)
-        return json.loads(raw.decode("utf-8"))
-
-def _get_folder_contents(course_id, parent_id):
-    """Get all items in a folder."""
-    url = (f"{CLASSX_API_BASE}/get/folder_contentsv3"
-           f"?start=0&course_id={course_id}&parent_id={parent_id}")
-    return _api_get(url)
-
-def _get_video_details(course_id, video_id):
-    """Get full video details including encrypted links."""
-    url = (f"{CLASSX_API_BASE}/get/fetchVideoDetailsById"
-           f"?course_id={course_id}&folder_wise_course=1&ytflag=0&video_id={video_id}")
-    return _api_get(url)
-
-def _parse_links_field(field_val):
-    """Parse encrypted_links or download_links whether it's a list or a stringified list/json."""
-    if not field_val:
-        return []
-    if isinstance(field_val, list):
-        return field_val
-    if isinstance(field_val, str):
-        field_val = field_val.strip()
-        try:
-            parsed = json.loads(field_val)
-            if isinstance(parsed, list):
-                return parsed
-        except Exception:
-            pass
-        try:
-            import ast
-            parsed = ast.literal_eval(field_val)
-            if isinstance(parsed, list):
-                return parsed
-        except Exception:
-            pass
-        paths = re.findall(r'[\'"]path[\'"]\s*:\s*[\'"]([^\'"]+)[\'"]', field_val)
-        if paths:
-            return [{"path": p} for p in paths]
-        links = re.findall(r'[\'"](?:file_link|download_link|url|link)[\'"]\s*:\s*[\'"]([^\'"]+)[\'"]', field_val)
-        if links:
-            return [{"path": l} for l in links]
-
-    return []
-
-def _clean_b64(s):
-    """Clean backslashes and fix base64 padding."""
+def clean_b64(s: str) -> str:
+    """Fix base64 string padding."""
     if not s:
         return ""
     s = str(s).replace("\\/", "/").replace("\\", "").strip()
     return s + "=" * ((4 - len(s) % 4) % 4)
 
-def _decrypt_classx_url(encrypted_str, iv_string=None):
-    """Decrypt ClassX encrypted video/pdf link (handles cipher_b64:iv_b64 payload format)."""
+def decrypt_classx_url(encrypted_str: str) -> str:
+    """Decrypt ClassX or encrypted stream/PDF links."""
     if not encrypted_str or not isinstance(encrypted_str, str):
         return ""
-
     encrypted_str = encrypted_str.strip()
     if encrypted_str.startswith("http"):
         return encrypted_str
-
+        
     key = b"6385731993184651"
-
-    # Format 1: cipher_b64:iv_b64 payload (ClassX standard format)
     if ":" in encrypted_str:
         parts = encrypted_str.split(":", 1)
-        cipher_b64 = _clean_b64(parts[0])
-        iv_b64 = _clean_b64(parts[1])
+        cipher_b64 = clean_b64(parts[0])
+        iv_b64 = clean_b64(parts[1])
         try:
             iv = base64.b64decode(iv_b64)
             if len(iv) >= 16:
@@ -367,1577 +212,684 @@ def _decrypt_classx_url(encrypted_str, iv_string=None):
             decrypted = cipher.decrypt(base64.b64decode(cipher_b64))
             decrypted_str = unpad(decrypted, AES.block_size).decode("utf-8", errors="ignore").strip()
             if decrypted_str.startswith("http"):
-                print(f"[DECRYPT] Decrypted payload URL: {decrypted_str[:70]}...")
-                return decrypted_str
-        except Exception as e:
-            print(f"[DECRYPT] Payload decode error: {e}")
-
-    # Format 2: standalone cipher_b64 with optional iv_string or default key/IV
-    cipher_b64 = _clean_b64(encrypted_str.split(":")[0] if ":" in encrypted_str else encrypted_str)
-
-    iv_candidates = []
-    if iv_string:
-        try:
-            raw_iv = base64.b64decode(_clean_b64(iv_string))
-            if len(raw_iv) >= 16:
-                iv_candidates.append(raw_iv[:16])
-        except Exception:
-            pass
-        if len(iv_string.encode("utf-8")) >= 16:
-            iv_candidates.append(iv_string.encode("utf-8")[:16])
-    iv_candidates.append(key)
-
-    for try_iv in iv_candidates:
-        try:
-            cipher = AES.new(key, AES.MODE_CBC, try_iv)
-            decrypted = cipher.decrypt(base64.b64decode(cipher_b64))
-            decrypted_str = unpad(decrypted, AES.block_size).decode("utf-8", errors="ignore").strip()
-            if decrypted_str.startswith("http"):
-                print(f"[DECRYPT] Decrypted fallback URL: {decrypted_str[:70]}...")
                 return decrypted_str
         except Exception:
             pass
+    return encrypted_str
 
-    return ""
-
-def _format_classx_player_url(val):
-    """If val is a raw ClassX token string (e.g. m7hcRsBTJp5eNY5aTdn8qpPBOzdeUe), format it into a secure player URL."""
-    if not val or not isinstance(val, str):
-        return ""
-    val = val.strip()
-    if val.startswith("http"):
-        return val
-    # If 15-120 characters long token string without spaces/json
-    if 15 <= len(val) <= 120 and not any(c in val for c in [" ", "\n", "\t", "{", "}", "[", "]"]):
-        return f"https://player.appx.co.in/secure-player?isMobile=true&token={val}"
-    return ""
-
-def _find_url_in_dict(obj):
-    """Recursively search for a video URL, decryptable string, or token in any dict or list."""
-    if isinstance(obj, dict):
-        iv_str = obj.get("iv_string") or obj.get("iv") or ""
-
-        # 0. PRIORITY 0: Check explicit ClassX URL keys (video_player_url, download_url_higher_version, etc.)
-        classx_player_keys = [
-            "video_player_url", "download_url_higher_version", "download_url_lower_version",
-            "video_player_lower_url"
-        ]
-        for key in classx_player_keys:
-            if key in obj and obj[key]:
-                val = str(obj[key]).strip()
-                if val and val.startswith("http"):
-                    # If URL ends with token=, try to append valid token if available; otherwise skip incomplete template URL
-                    if "token=" in val.lower() and val.lower().endswith("token="):
-                        tok = obj.get("file_link") or obj.get("download_link") or obj.get("video_player_token") or ""
-                        if tok and tok != "1234":
-                            val = val + str(tok).strip()
-                        else:
-                            continue
-                    print(f"[RESOLVE] Found ClassX player URL from '{key}': {val[:60]}...")
-                    return val
-                elif val:
-                    dec = _decrypt_classx_url(val, iv_str)
-                    if dec and dec.startswith("http"):
-                        return dec
-
-        # 1. Check array fields: encrypted_links, download_links, livestream_links
-        list_fields = ["encrypted_links", "download_links", "livestream_links", "links", "qualities"]
-        for lf in list_fields:
-            if lf in obj and obj[lf]:
-                items_list = _parse_links_field(obj[lf])
-                for sub_item in items_list:
-                    if isinstance(sub_item, dict):
-                        for k in ["path", "file_link", "download_link", "url", "link", "encrypted_link"]:
-                            val = sub_item.get(k)
-                            if val:
-                                val_str = str(val).strip()
-                                dec = _decrypt_classx_url(val_str, iv_str)
-                                if dec and dec.startswith("http"):
-                                    print(f"[RESOLVE] Decrypted direct stream link from {lf}[{k}]: {dec[:60]}...")
-                                    return dec
-                                player_url = _format_classx_player_url(val_str)
-                                if player_url:
-                                    print(f"[RESOLVE] Formatted player URL from {lf}[{k}]: {player_url[:60]}...")
-                                    return player_url
-
-        # 2. Check encrypted/token single fields
-        enc_keys = [
-            "encrypted_link", "file_link", "download_link", "encrypted_link_720",
-            "encrypted_link_480", "encrypted_link_360", "encrypted_link_1080", "encrypted_url"
-        ]
-        for key in enc_keys:
-            if key in obj and obj[key]:
-                val = str(obj[key]).strip()
-                if val:
-                    if val.startswith("http"):
-                        if not val.lower().endswith("token="):
-                            return val
-                    dec = _decrypt_classx_url(val, iv_str)
-                    if dec and dec.startswith("http"):
-                        print(f"[RESOLVE] Decrypted direct stream link from '{key}': {dec[:60]}...")
-                        return dec
-                    player_url = _format_classx_player_url(val)
-                    if player_url:
-                        print(f"[RESOLVE] Formatted player URL from '{key}': {player_url[:60]}...")
-                        return player_url
-
-        # 3. Direct stream URL fields (.m3u8 / .mp4 / akamai / stream)
-        stream_keys = [
-            "hls_url", "m3u8_url", "stream_url", "video_url", "video_link",
-            "video_url_720", "video_url_480", "video_url_360", "video_url_1080",
-            "url_720", "url_480", "url_360", "url_1080", "path", "file_url"
-        ]
-        for key in stream_keys:
-            if key in obj and obj[key]:
-                val = str(obj[key]).strip()
-                if "secure-player" in val.lower() and val.lower().endswith("token="):
-                    continue
-                if val.startswith("http"):
-                    if any(ext in val.lower() for ext in [".m3u8", ".mp4", "akamai", "cdn", "hls"]):
-                        return val
-                    dec = _decrypt_classx_url(val, iv_str)
-                    if dec and dec.startswith("http"):
-                        return dec
-                    player_url = _format_classx_player_url(val)
-                    if player_url:
-                        return player_url
-
-        # 4. Fallback fields (download_link, url, link)
-        for key in ["download_link", "url", "link"]:
-            if key in obj and obj[key]:
-                val = str(obj[key]).strip()
-                if "secure-player" in val.lower() and val.lower().endswith("token="):
-                    continue
-                if val.startswith("http"):
-                    dec = _decrypt_classx_url(val, iv_str)
-                    if dec and dec.startswith("http"):
-                        return dec
-                    if not val.lower().endswith("token="):
-                        return val
-                else:
-                    player_url = _format_classx_player_url(val)
-                    if player_url:
-                        return player_url
-
-        # 5. Recursive search in sub-dictionaries / lists
-        for k, v in obj.items():
-            if k in ["lecture_summary_url", "image", "thumbnail", "photo", "icon", "banner"]:
-                continue
-            if isinstance(v, (dict, list)):
-                res = _find_url_in_dict(v)
-                if res:
-                    return res
-
-    elif isinstance(obj, list):
-        for item in obj:
-            res = _find_url_in_dict(item)
-            if res:
-                return res
-
-    return ""
-
-from urllib.parse import urlparse, parse_qs, unquote
-
-def _decode_jwt_or_base64(token_str):
-    """Try to decode JWT token payload, Base64 string, or AES to find video URLs."""
-    if not token_str or not isinstance(token_str, str):
-        return ""
-
-    token_str = token_str.strip()
-
-    # 1. Try direct AES decryption
-    dec = _decrypt_classx_url(token_str)
-    if dec and dec.startswith("http"):
-        return dec
-
-    # 2. Try URL decoding if double encoded
-    try:
-        unquoted = unquote(token_str)
-        if unquoted != token_str and unquoted.startswith("http"):
-            return unquoted
-    except Exception:
-        pass
-
-    # 3. Try JWT token (parts separated by dot e.g. eyJ...)
-    if "." in token_str:
-        parts = token_str.split(".")
-        for part in parts:
-            if len(part) > 8:
-                for b64_fn in [base64.urlsafe_b64decode, base64.b64decode]:
-                    try:
-                        part_b64 = part + "=" * ((4 - len(part) % 4) % 4)
-                        decoded_bytes = b64_fn(part_b64)
-                        decoded_str = decoded_bytes.decode("utf-8", errors="ignore")
-                        urls = re.findall(r'https?://[^\s"\'\\{}]+', decoded_str)
-                        for u in urls:
-                            if any(k in u.lower() for k in [".m3u8", ".mp4", "stream", "akamai", "cdn", "hls"]):
-                                return u
-                        if urls:
-                            return urls[0]
-                    except Exception:
-                        pass
-
-    # 4. Try standard Base64 / URL-safe Base64
-    for b64_fn in [base64.urlsafe_b64decode, base64.b64decode]:
-        try:
-            b64 = token_str + "=" * ((4 - len(token_str) % 4) % 4)
-            decoded_bytes = b64_fn(b64)
-            decoded_str = decoded_bytes.decode("utf-8", errors="ignore")
-            urls = re.findall(r'https?://[^\s"\'\\{}]+', decoded_str)
-            for u in urls:
-                if any(k in u.lower() for k in [".m3u8", ".mp4", "stream", "akamai", "cdn", "hls"]):
-                    return u
-            if urls:
-                return urls[0]
-        except Exception:
-            pass
-
-def _resolve_master_m3u8(url):
-    """If url is an HLS master playlist with query tokens, resolve the child playlist URL with query parameters appended."""
-    if not url or not isinstance(url, str) or ".m3u8" not in url.lower():
-        return url
-
-    try:
-        parsed = urlparse(url)
-        query = parsed.query
-        if not query:
-            return url
-
-        # Fetch master m3u8 content
-        req = Request(url)
-        all_h = _get_all_headers()
-        for k, v in all_h.items():
-            req.add_header(k, v)
-
-        with urlopen(req, timeout=10) as resp:
-            raw_data = resp.read()
-            if resp.headers.get("Content-Encoding") == "gzip":
-                raw_data = gzip.decompress(raw_data)
-            m3u8_text = raw_data.decode("utf-8", errors="replace")
-
-        # Find child m3u8 playlist links in master.m3u8
-        lines = [line.strip() for line in m3u8_text.splitlines() if line.strip() and not line.startswith("#")]
-        if lines:
-            child_path = lines[-1]  # Pick highest quality / last playlist line
-            child_url = urljoin(url, child_path)
-            if "?" not in child_url and query:
-                child_url = f"{child_url}?{query}"
-            print(f"[RESOLVE] Resolved master m3u8 -> child playlist URL: {child_url[:80]}...")
-            return child_url
-    except Exception as e:
-        print(f"[RESOLVE] _resolve_master_m3u8 error: {e}")
-
-    return url
-
-
-def _extract_stream_from_secure_player(url):
-    """If url is an Appx secure-player link, resolve the actual .m3u8 or .mp4 stream URL."""
-    if not url or not isinstance(url, str):
-        return url
-
-    resolved = url
-    if "secure-player" in url.lower() or "player.appx" in url.lower():
-        print(f"[PLAYER] Resolving Appx player URL: {url}")
-        
-        # 1. Check ALL query params in URL
-        try:
-            parsed = urlparse(url)
-            qs = parse_qs(parsed.query)
-            for param_key, val_list in qs.items():
-                for raw_val in val_list:
-                    val = unquote(raw_val)
-                    if val.startswith("http") and ("m3u8" in val or "mp4" in val or "akamai" in val or "hls" in val):
-                        print(f"[PLAYER] Found direct URL in param '{param_key}': {val}")
-                        resolved = val
-                        break
-                    decoded = _decode_jwt_or_base64(val)
-                    if decoded:
-                        print(f"[PLAYER] Decoded URL from param '{param_key}': {decoded}")
-                        resolved = decoded
-                        break
-                if resolved != url:
-                    break
-        except Exception as e:
-            print(f"[PLAYER] Query param parse error: {e}")
-
-        if resolved == url:
-            # 2. Fetch HTML body of player page with full ClassX API headers
-            try:
-                all_h = _get_all_headers()
-                req = Request(url)
-                for k, v in all_h.items():
-                    req.add_header(k, v)
-
-                with urlopen(req, timeout=15) as resp:
-                    raw_html = resp.read()
-                    if resp.headers.get("Content-Encoding") == "gzip":
-                        raw_html = gzip.decompress(raw_html)
-                    html = raw_html.decode("utf-8", errors="replace")
-
-                # Search for direct .m3u8 or .mp4 links in HTML
-                m3u8_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html)
-                if m3u8_matches:
-                    print(f"[PLAYER] Found m3u8 URL in HTML: {m3u8_matches[0]}")
-                    resolved = m3u8_matches[0]
-                else:
-                    mp4_matches = re.findall(r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*', html)
-                    if mp4_matches:
-                        print(f"[PLAYER] Found mp4 URL in HTML: {mp4_matches[0]}")
-                        resolved = mp4_matches[0]
-                    else:
-                        source_matches = re.findall(r'(?:file|source|src|url|hls|video)\s*:\s*["\'](https?://[^"\']+)["\']', html, re.IGNORECASE)
-                        for src in source_matches:
-                            if not any(src.lower().endswith(ext) for ext in [".js", ".css", ".png", ".jpg"]):
-                                print(f"[PLAYER] Found source match in JS: {src}")
-                                resolved = src
-                                break
-
-            except Exception as e:
-                print(f"[PLAYER] Error fetching player page HTML: {e}")
-
-    return _resolve_master_m3u8(resolved)
-
-
-def _resolve_video_url(item_data, course_id):
-    """Extract or fetch video URL for a given item.
-
-    Returns (url: str, error_msg: str).
-    """
-    # 1. Check direct fields on item_data first
-    url = _find_url_in_dict(item_data)
-    if url:
-        url = _extract_stream_from_secure_player(url)
-        return url, ""
-
-    # 2. Check direct token keys on item_data if _find_url_in_dict missed them
-    for k in ["file_link", "download_link", "encrypted_link", "study_material_link", "pdf_link"]:
-        if k in item_data and item_data[k]:
-            v = str(item_data[k]).strip()
-            p_url = _format_classx_player_url(v)
-            if p_url:
-                p_url = _extract_stream_from_secure_player(p_url)
-                return p_url, ""
-
-    # 3. Fetch video details via API if ID exists
-    video_id = item_data.get("id") or item_data.get("video_id")
-    if not video_id:
-        keys_found = list(item_data.keys())
-        return "", f"No video ID in item (keys: {keys_found[:5]})"
-
-    try:
-        details = _get_video_details(course_id, video_id)
-        if isinstance(details, dict):
-            status = details.get("status")
-            ddata = details.get("data", {})
-            if status == 200 and isinstance(ddata, dict):
-                url = _find_url_in_dict(ddata)
-                if url:
-                    url = _extract_stream_from_secure_player(url)
-                    return url, ""
-                for k in ["file_link", "download_link", "encrypted_link", "study_material_link", "pdf_link"]:
-                    if k in ddata and ddata[k]:
-                        v = str(ddata[k]).strip()
-                        p_url = _format_classx_player_url(v)
-                        if p_url:
-                            p_url = _extract_stream_from_secure_player(p_url)
-                            return p_url, ""
-    except Exception as e:
-        print(f"[RESOLVE] Exception fetching video details: {e}")
-
-    kv_sample = {k: str(v)[:30] for k, v in item_data.items() if v}
-    return "", f"No link in API data. KVs: {kv_sample}"
-
-def _resolve_pdf_urls(item_data):
-    """Extract PDF URLs from item data (decrypted if encrypted)."""
-    pdfs = []
-    
-    # ClassX can have multiple PDFs (study_material_link, pdf_link, pdf_link2, pdf_link3, etc.)
-    pdf_fields = ["study_material_link", "pdf_link"] + [f"pdf_link{i}" for i in range(2, 11)]
-    
-    for field in pdf_fields:
-        link = item_data.get(field, "")
-        if not link:
-            continue
-        link = str(link).strip()
-        if link.startswith("http"):
-            pdfs.append(link)
-        else:
-            dec = _decrypt_classx_url(link)
-            if dec and dec.startswith("http"):
-                pdfs.append(dec)
-    return pdfs
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _get_video_metadata(video_path):
-    """Extract duration, width, height from video using ffprobe."""
-    try:
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,duration",
-            "-show_entries", "format=duration",
-            "-of", "json",
-            str(video_path)
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        if res.returncode == 0:
-            data = json.loads(res.stdout)
-            streams = data.get("streams", [{}])
-            fmt = data.get("format", {})
-            width = int(streams[0].get("width", 1280)) if (streams and streams[0].get("width")) else 1280
-            height = int(streams[0].get("height", 720)) if (streams and streams[0].get("height")) else 720
-            
-            dur = 0
-            if streams and streams[0].get("duration"):
-                try:
-                    dur = float(streams[0]["duration"])
-                except ValueError:
-                    pass
-            if not dur and fmt.get("duration"):
-                try:
-                    dur = float(fmt["duration"])
-                except ValueError:
-                    pass
-            return int(dur), width, height
-    except Exception as e:
-        print(f"[METADATA] ffprobe error: {e}")
-
-    return 0, 1280, 720
-
-
-def _generate_thumbnail(video_path, thumb_path):
-    """Generate JPEG thumbnail cover image from video frame using ffmpeg."""
-    try:
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", "00:00:05",
-            "-i", str(video_path),
-            "-vframes", "1",
-            "-vf", "scale=320:-1",
-            str(thumb_path)
-        ]
-        res = subprocess.run(cmd, capture_output=True, timeout=15)
-        if res.returncode == 0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
-            return thumb_path
-    except Exception as e:
-        print(f"[THUMB] Error generating thumbnail: {e}")
-
-    return None
-
-
-def format_bytes(size):
-    """Convert byte count to human-readable string."""
+def format_bytes(size: int) -> str:
+    """Format size in bytes to human readable string."""
     if size <= 0:
         return "0 B"
     units = ["B", "KB", "MB", "GB", "TB"]
-    idx = 0
-    size = float(size)
-    while size >= 1024.0 and idx < len(units) - 1:
-        size /= 1024.0
-        idx += 1
-    return f"{size:.2f} {units[idx]}"
+    i = int(math.floor(math.log(size, 1024)))
+    p = math.pow(1024, i)
+    s = round(size / p, 2)
+    return f"{s} {units[i]}"
 
-
-def extract_url(text):
-    """Return the first HTTP(S) URL found in text, or None."""
-    match = re.search(r"https?://\S+", text)
-    return match.group(0) if match else None
-
-
-def is_supported_url(url):
-    """Check whether the URL looks like a supported video or document link."""
-    keywords = ["m3u8", "video", "stream", "mp4", "hls", ".ts", ".pdf", "player", "appx", "secure"]
-    lower = url.lower()
-    return any(kw in lower for kw in keywords)
-
-
-def is_pdf_url(url):
-    return ".pdf" in url.lower()
-
-
-def check_token_expiry(url):
-    """Check if the edge-cache-token in the URL has expired.
-
-    Returns (is_expired: bool, expiry_ist_str: str or None).
-    If no Expires field is found, returns (False, None) so download proceeds.
-    """
-    match = re.search(r"Expires=(\d+)", url)
-    if not match:
-        return False, None
-
-    expires_ts = int(match.group(1))
-    now_ts = int(time.time())
-    ist = timezone(timedelta(hours=5, minutes=30))
-    expiry_dt = datetime.fromtimestamp(expires_ts, tz=ist)
-    expiry_str = expiry_dt.strftime("%I:%M %p %d/%m/%Y")
-
-    if now_ts > expires_ts:
-        return True, expiry_str
-    return False, expiry_str
-
-
-def check_url_accessible(url):
-    """Test if the URL is accessible. Returns (ok, status_code, error_msg)."""
-    try:
-        req = Request(url)
-        for key, val in HEADERS.items():
-            req.add_header(key, val)
-        resp = urlopen(req, timeout=15)
-        resp.read(1024)  # Read a small chunk to verify
-        resp.close()
-        return True, resp.status, None
-    except HTTPError as e:
-        return False, e.code, f"HTTP {e.code}: {e.reason}"
-    except URLError as e:
-        return False, 0, f"URL Error: {e.reason}"
-    except Exception as e:
-        return False, 0, str(e)
-
+def get_readable_time(seconds: int) -> str:
+    """Format seconds into HH:MM:SS string."""
+    if seconds <= 0:
+        return "0s"
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
 # ---------------------------------------------------------------------------
-# Owner-group-only filter
+# Progress Loop Updater
 # ---------------------------------------------------------------------------
 
-
-def _owner_group_check(_, __, message):
-    if not message or not message.chat:
-        return False
-    # Strictly respond ONLY in OWNER_GROUP
-    if message.chat.id == OWNER_GROUP:
-        return True
-    return False
-
-
-owner_filter = filters.create(_owner_group_check)
-
-# ---------------------------------------------------------------------------
-# Background progress message updater
-# ---------------------------------------------------------------------------
-
-
-def _upload_progress(current, total, *args):
-    """Callback for Pyrogram upload progress updates."""
-    task_id = args[0] if args else None
-    if task_id and task_id in progress_data:
-        progress_data[task_id]["current"] = current
-        progress_data[task_id]["total"] = total
-
-
-async def _progress_loop(status_msg, task_id):
-    """Edit status message with clean format (Current MB / Total MB & Speed MB/s)."""
-    last_text = ""
-    last_current = 0
-    last_time = time.time()
-    speed = 0.0
-
+async def _progress_loop(status_msg: Message, task_id: str, title: str = ""):
+    """Background task updating message progress in real-time."""
+    start_time = time.time()
+    last_update = 0
+    
     while task_id in progress_data:
-        info = progress_data.get(task_id)
-        if info is None:
+        await asyncio.sleep(2)
+        if task_id in cancelled_tasks:
             break
-
-        phase = info.get("phase", "")
-        current = info.get("current", 0)
-        total = info.get("total", 0)
-
+            
+        data = progress_data.get(task_id, {})
+        phase = data.get("phase", "Processing...")
+        current = data.get("current", 0)
+        total = data.get("total", 0)
+        
         now = time.time()
-        dt = now - last_time
-
-        if dt >= 1.0:
-            diff = current - last_current
-            if diff > 0:
-                speed = diff / dt
-            elif diff < 0:
-                speed = 0.0
-            last_current = current
-            last_time = now
-
-        speed_str = f"{format_bytes(speed)}/s" if speed > 0 else "0 B/s"
-
-        lines = [f"{phase}", ""]
-
+        elapsed = now - start_time
+        
         if total > 0:
-            lines.append(f"{format_bytes(current)} / {format_bytes(total)}")
-            lines.append(f"Speed: {speed_str}")
+            pct = (current / total) * 100
+            speed = current / elapsed if elapsed > 0 else 0
+            eta = (total - current) / speed if speed > 0 else 0
+            
+            filled = int(pct // 10)
+            bar = "🟩" * filled + "⬜" * (10 - filled)
+            text = (
+                f"📥 **{title or 'Downloading File'}**\n\n"
+                f"⚙️ **Status:** {phase}\n"
+                f"📊 **Progress:** [{bar}] {pct:.1f}%\n"
+                f"💾 **Size:** {format_bytes(current)} / {format_bytes(total)}\n"
+                f"🚀 **Speed:** {format_bytes(int(speed))}/s | ⏳ **ETA:** {get_readable_time(int(eta))}"
+            )
         else:
-            lines.append(f"{format_bytes(current)}")
-            lines.append(f"Speed: {speed_str}")
-
-        text = "\n".join(lines)
-
-        if text != last_text:
+            speed = current / elapsed if elapsed > 0 else 0
+            text = (
+                f"📥 **{title or 'Downloading File'}**\n\n"
+                f"⚙️ **Status:** {phase}\n"
+                f"💾 **Downloaded:** {format_bytes(current)}\n"
+                f"🚀 **Speed:** {format_bytes(int(speed))}/s | ⏱️ **Elapsed:** {get_readable_time(int(elapsed))}"
+            )
+            
+        if now - last_update >= 3:
             try:
-                btn = InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"cancel_{task_id}")]])
-                await status_msg.edit_text(text, reply_markup=btn)
-                last_text = text
-            except FloodWait as e:
-                await asyncio.sleep(e.value + 1)
+                await status_msg.edit_text(
+                    text,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⛔ Cancel / Stop", callback_data=f"cancel_{task_id}")]
+                    ])
+                )
+                last_update = now
             except Exception:
                 pass
 
-        await asyncio.sleep(2)
-
-
 # ---------------------------------------------------------------------------
-# Direct Downloader (For PDFs and standard files)
+# Downloaders (PDF & Video)
 # ---------------------------------------------------------------------------
 
-async def _download_direct(url, output_path, task_id):
-    """Download a simple file natively without yt-dlp."""
-    all_headers = _get_all_headers()
-    
-    def do_download():
-        req = Request(url)
-        for k, v in all_headers.items():
-            req.add_header(k, v)
+async def download_pdf(url: str, output_path: str, task_id: str) -> Tuple[bool, str]:
+    """Download direct PDF file."""
+    try:
+        url = decrypt_classx_url(url)
+        req = Request(url, headers=HEADERS)
+        with urlopen(req, timeout=60) as resp:
+            total_size = int(resp.headers.get("Content-Length", 0))
+            progress_data[task_id] = {"phase": "Downloading PDF...", "current": 0, "total": total_size}
             
-        try:
-            with urlopen(req, timeout=30) as response, open(output_path, 'wb') as out_file:
+            downloaded = 0
+            with open(output_path, "wb") as f:
                 while True:
                     if task_id in cancelled_tasks:
                         return False, "Cancelled by user"
-                    if task_id not in progress_data:
-                        return False, "Cancelled"
-                    chunk = response.read(1048576)
+                    chunk = resp.read(1024 * 128)
                     if not chunk:
                         break
-                    out_file.write(chunk)
-                    progress_data[task_id]["current"] = os.path.getsize(output_path)
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if task_id in progress_data:
+                        progress_data[task_id]["current"] = downloaded
             return True, ""
-        except Exception as e:
-            return False, str(e)
-            
-    return await asyncio.to_thread(do_download)
+    except Exception as e:
+        return False, str(e)
 
-
-# ---------------------------------------------------------------------------
-# Video downloader (yt-dlp primary, ffmpeg fallback)
-# ---------------------------------------------------------------------------
-
-
-async def _download_video(url, output_path, task_id):
-    """Download HLS video. Tries yt-dlp first, falls back to ffmpeg.
-
-    Returns (success: bool, error_msg: str).
-    """
-    # Merge default + custom headers
-    all_headers = _get_all_headers()
-    ffmpeg_headers = "".join(f"{k}: {v}\r\n" for k, v in all_headers.items())
-
-    # File size monitor (shared by both yt-dlp and ffmpeg)
-    async def _monitor():
-        while task_id in progress_data:
-            try:
-                for p in [output_path] + list(DOWNLOAD_DIR.glob(f"{Path(output_path).stem}*")):
-                    p = str(p)
-                    if os.path.exists(p):
-                        size = os.path.getsize(p)
-                        if size > 0 and task_id in progress_data:
-                            progress_data[task_id]["current"] = size
-                            break
-            except OSError:
-                pass
-            await asyncio.sleep(0.5)
-
-    monitor = asyncio.create_task(_monitor())
-
-    # --- Try yt-dlp first ---
-    ytdlp_err = "yt-dlp execution failed"
+async def download_video(url: str, output_path: str, task_id: str, quality: str = "720") -> Tuple[bool, str]:
+    """Download video stream using yt-dlp."""
     try:
-        yt_bin = shutil.which("yt-dlp")
-        ytdlp_base = [yt_bin] if yt_bin else [sys.executable, "-m", "yt_dlp"]
-
-        user_agent_val = all_headers.get("User-Agent") or HEADERS["User-Agent"]
-        referer_val = all_headers.get("Referer") or HEADERS["Referer"]
-
-        ytdlp_cmd = ytdlp_base + [
-            "--no-warnings",
+        url = decrypt_classx_url(url)
+        format_spec = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
+        
+        cmd = [
+            sys.executable, "-m", "yt_dlp",
             "--no-check-certificates",
-            "--user-agent", user_agent_val,
-            "--referer", referer_val,
-            "-N", "16",
-            "--concurrent-fragments", "16",
-            "--fragment-retries", "10",
-            "--retries", "10",
-            "--file-access-retries", "10",
+            "--no-warnings",
+            "--concurrent-fragments", "8",
+            "-f", format_spec,
+            "--merge-output-format", "mp4",
+            "-o", output_path,
+            url
         ]
-
-        for hk, hv in all_headers.items():
-            ytdlp_cmd += ["--add-header", f"{hk}: {hv}"]
-        ytdlp_cmd += ["-o", output_path, url]
-
-        print(f"[DOWNLOAD] Trying yt-dlp via {' '.join(ytdlp_base)}...")
+        
+        for k, v in HEADERS.items():
+            cmd.extend(["--add-header", f"{k}:{v}"])
+            
         process = await asyncio.create_subprocess_exec(
-            *ytdlp_cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
         active_processes[task_id] = process
-        _, stderr_bytes = await process.communicate()
+        progress_data[task_id] = {"phase": "Downloading Video...", "current": 0, "total": 0}
+        
+        while True:
+            if task_id in cancelled_tasks:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                return False, "Cancelled by user"
+                
+            line = await process.stdout.readline()
+            if not line:
+                break
+            line_str = line.decode("utf-8", errors="ignore").strip()
+            
+            # Parse yt-dlp percentage lines
+            match = re.search(r'\[download\]\s+(\d+\.\d+)%\s+of\s+~?(\d+\.\d+)(\w+)', line_str)
+            if match:
+                pct = float(match.group(1))
+                size_num = float(match.group(2))
+                unit = match.group(3).upper()
+                mult = 1024 * 1024 if "M" in unit else (1024 * 1024 * 1024 if "G" in unit else 1024)
+                total_b = int(size_num * mult)
+                curr_b = int((pct / 100.0) * total_b)
+                if task_id in progress_data:
+                    progress_data[task_id]["total"] = total_b
+                    progress_data[task_id]["current"] = curr_b
+
+        await process.wait()
         active_processes.pop(task_id, None)
         
-        if task_id in cancelled_tasks:
-            return False, "Cancelled by user"
-
-        if process.returncode == 0 and os.path.exists(output_path):
-            file_size = os.path.getsize(output_path)
-            dur, _, _ = _get_video_metadata(output_path)
-            if file_size > 5 * 1024 * 1024 and dur > 30:
-                monitor.cancel()
-                print(f"[DOWNLOAD] yt-dlp succeeded ({file_size} bytes, duration {dur}s)")
-                return True, ""
-            else:
-                print(f"[DOWNLOAD] yt-dlp incomplete output: size={file_size}, duration={dur}s")
-
-        ytdlp_err = stderr_bytes.decode(errors="replace").strip()
-        print(f"[DOWNLOAD] yt-dlp failed (size={os.path.getsize(output_path) if os.path.exists(output_path) else 0}): {ytdlp_err[-200:]}")
-
-    except FileNotFoundError as fnf:
-        print(f"[DOWNLOAD] yt-dlp binary not found: {fnf}")
-        ytdlp_err = f"yt-dlp binary not found ({fnf})"
-    except Exception as exc:
-        print(f"[DOWNLOAD] yt-dlp exception: {exc}")
-        ytdlp_err = str(exc)
-
-    # --- Fallback to ffmpeg ---
-    print(f"[DOWNLOAD] Falling back to ffmpeg...")
-
-    # Clean up any partial yt-dlp output
-    for f in DOWNLOAD_DIR.glob(f"{Path(output_path).stem}*"):
-        try:
-            f.unlink()
-        except OSError:
-            pass
-
-    user_agent_val = all_headers.get("User-Agent") or HEADERS["User-Agent"]
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-y",
-        "-threads", "4",
-        "-user_agent", user_agent_val,
-        "-headers", ffmpeg_headers,
-        "-reconnect", "1",
-        "-reconnect_at_eof", "1",
-        "-reconnect_streamed", "1",
-        "-reconnect_delay_max", "5",
-        "-i", url,
-        "-c", "copy",
-        "-bsf:a", "aac_adtstoasc",
-        "-movflags", "+faststart",
-        output_path,
-    ]
-
-    process = await asyncio.create_subprocess_exec(
-        *ffmpeg_cmd,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    active_processes[task_id] = process
-    _, stderr_bytes = await process.communicate()
-    active_processes.pop(task_id, None)
-
-    if task_id in cancelled_tasks:
-        return False, "Cancelled by user"
-
-    # Stop monitor
-    progress_data.pop(task_id, None)
-    monitor.cancel()
-    try:
-        await monitor
-    except asyncio.CancelledError:
-        pass
-
-    if process.returncode == 0 and os.path.exists(output_path):
-        file_size = os.path.getsize(output_path)
-        dur, _, _ = _get_video_metadata(output_path)
-        if file_size > 5 * 1024 * 1024 and dur > 30:
-            print(f"[DOWNLOAD] ffmpeg succeeded ({file_size} bytes, duration {dur}s)")
-            return True, ""
-        else:
-            print(f"[DOWNLOAD] ffmpeg incomplete output: size={file_size}, duration={dur}s")
-
-    ffmpeg_err = stderr_bytes.decode(errors="replace").strip()
-    last_lines = "\n".join(ffmpeg_err.split("\n")[-3:])
-    print(f"[DOWNLOAD] ffmpeg also failed: {last_lines}")
-    return False, f"yt-dlp: {ytdlp_err[-300:]}\n\nffmpeg: {last_lines}"
-
-
-# ---------------------------------------------------------------------------
-# Pyrogram upload progress callback
-# ---------------------------------------------------------------------------
-
-
-def _upload_progress(current, total, task_id):
-    """Called by pyrogram during upload.  Just updates the shared dict."""
-    if task_id in progress_data:
-        progress_data[task_id]["current"] = current
-        progress_data[task_id]["total"] = total
-
-
-# ---------------------------------------------------------------------------
-# /start command
-# ---------------------------------------------------------------------------
-
-
-@app.on_message(owner_filter & filters.command("start"))
-async def handle_start(client, message):
-    await message.reply_text(
-        "Bot is running...\n\n"
-        "/start - Show this message\n"
-        "/batch - Batch download chapter\n"
-        "/api - Show API config\n"
-        "/setapi - Set ClassX API credentials\n"
-        "/update - Pull from GitHub and restart"
-    )
-
-
-# ---------------------------------------------------------------------------
-# /setapi, /api, /clearapi
-# ---------------------------------------------------------------------------
-
-
-@app.on_message(owner_filter & filters.command("setapi"))
-async def handle_setapi(client, message):
-    """Set ClassX API credentials.
-
-    Usage: /setapi
-    authorization: eyJ0eXAi...
-    user-id: 154346
-    x-device-id: 20f953f4c295fe94
-    """
-    global api_config
-    lines = message.text.split("\n")[1:]
-    if not lines:
-        await message.reply_text(
-            "Usage:\n\n/setapi\n"
-            "authorization: eyJ0eXAi...\n"
-            "user-id: 154346\n"
-            "x-device-id: 20f953f4c295fe94"
-        )
-        return
-
-    parsed = {}
-    for line in lines:
-        line = line.strip()
-        if not line or ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        parsed[key.strip()] = value.strip()
-
-    if not parsed:
-        await message.reply_text("No valid config found...")
-        return
-
-    api_config = parsed
-    _save_api_config()
-
-    display = "\n".join(
-        f"{k}: {v[:40]}..." if len(v) > 40 else f"{k}: {v}"
-        for k, v in parsed.items()
-    )
-    await message.reply_text(f"API config saved...\n\n{display}")
-
-
-@app.on_message(owner_filter & filters.command("api"))
-async def handle_api(client, message):
-    if not api_config:
-        await message.reply_text("API config not set... Use /setapi")
-        return
-
-    display = "\n".join(
-        f"{k}: {v[:50]}..." if len(v) > 50 else f"{k}: {v}"
-        for k, v in api_config.items()
-    )
-    await message.reply_text(f"API Config:\n\n{display}")
-
-
-@app.on_message(owner_filter & filters.command("clearapi"))
-async def handle_clearapi(client, message):
-    global api_config
-    api_config = {}
-    if API_CONFIG_FILE.exists():
-        API_CONFIG_FILE.unlink()
-    await message.reply_text("API config cleared...")
-
-
-# ---------------------------------------------------------------------------
-# /batch command - Auto download entire chapter
-# ---------------------------------------------------------------------------
-
-
-@app.on_message(owner_filter & filters.command("batch"))
-async def handle_batch(client, message):
-    """Batch download all videos and PDFs from a chapter.
-
-    Usage: /batch <parent_id>
-    Or:    /batch <course_id> <parent_id>
-    """
-    if not api_config.get("authorization"):
-        await message.reply_text("API not configured... Use /setapi first")
-        return
-
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.reply_text("Usage: /batch <parent_id>")
-        return
-
-    if len(parts) >= 3:
-        course_id = parts[1]
-        parent_id = parts[2]
-    else:
-        course_id = api_config.get("course-id", "130")
-        parent_id = parts[1]
-
-    status_msg = await message.reply_text("Fetching chapter contents...")
-
-    # Step 1: Get folder contents
-    try:
-        folder_data = await asyncio.to_thread(_get_folder_contents, course_id, parent_id)
-    except Exception as e:
-        await status_msg.edit_text(f"API error...\n\n{e}")
-        return
-
-    if folder_data.get("status") != 200:
-        await status_msg.edit_text(f"API error...\n\n{folder_data.get('message', 'Unknown')}")
-        return
-
-    items = folder_data.get("data", [])
-    if not items:
-        await status_msg.edit_text("No items found in this chapter...")
-        return
-
-    total = len(items)
-    video_count = sum(1 for i in items if i.get("material_type") == "VIDEO")
-    
-    # Count total PDFs accurately
-    pdf_fields = ["study_material_link", "pdf_link"] + [f"pdf_link{i}" for i in range(2, 11)]
-    pdf_count = 0
-    for i in items:
-        for field in pdf_fields:
-            if i.get(field):
-                pdf_count += 1
-
-    await status_msg.edit_text(
-        f"Found {total} items...\n"
-        f"Videos: {video_count}\n"
-        f"PDFs: {pdf_count}\n\n"
-        f"Processing started..."
-    )
-    await asyncio.sleep(2)
-
-    # Step 2: Process each item
-    success_count = 0
-    fail_count = 0
-    failed_reasons = []
-
-    for idx, item in enumerate(items, 1):
-        title = item.get("Title") or item.get("title") or f"Item {idx}"
-        item_id = item.get("id") or item.get("video_id")
-        material_type = item.get("material_type") or item.get("type", "")
-
-        try:
-            await status_msg.edit_text(f"Processing {idx}/{total}...\n\nTitle: {title}")
-        except Exception:
-            pass
-
-        # --- Handle PDFs ---
-        pdf_urls = _resolve_pdf_urls(item)
-        if pdf_urls:
-            try:
-                await status_msg.edit_text(f"[{idx}/{total}] {title} - Found {len(pdf_urls)} PDFs")
-            except Exception:
-                pass
-            await asyncio.sleep(2)
-
-        for pidx, pdf_url in enumerate(pdf_urls):
-            try:
-                pdf_label = f"{title} - PDF{pidx + 1}" if len(pdf_urls) > 1 else f"{title} - PDF"
-                task_id = f"batch_pdf_{item_id}_{pidx}_{int(time.time())}"
-                pdf_filename = f"{pdf_label}.pdf".replace("/", "-").replace("\\", "-")
-                pdf_path = str(DOWNLOAD_DIR / pdf_filename)
-
-                progress_data[task_id] = {
-                    "phase": f"Downloading...\n{pdf_label}",
-                    "current": 0,
-                    "total": 0,
-                }
-
-                updater = asyncio.create_task(_progress_loop(status_msg, task_id))
-                success, err = await _download_direct(pdf_url, pdf_path, task_id)
-
-                if not success or not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
-                    progress_data.pop(task_id, None)
-                    updater.cancel()
-                    fail_count += 1
-                    failed_reasons.append(f"PDF '{pdf_label}': Download failed - {err[:150]}")
-                    try:
-                        await status_msg.edit_text(f"PDF download failed for {pdf_label}:\n{err}")
-                        await asyncio.sleep(3)
-                    except Exception:
-                        pass
-                    continue
-
-                file_size = os.path.getsize(pdf_path)
-                progress_data[task_id] = {
-                    "phase": f"Uploading...\n{pdf_label}",
-                    "current": 0,
-                    "total": file_size,
-                }
-
-                await client.send_document(
-                    chat_id=message.chat.id,
-                    document=pdf_path,
-                    file_name=pdf_filename,
-                    caption=pdf_label,
-                    progress=_upload_progress,
-                    progress_args=(task_id,),
-                )
-
-                progress_data.pop(task_id, None)
-                updater.cancel()
-                success_count += 1
-
-            except Exception as e:
-                fail_count += 1
-                failed_reasons.append(f"PDF '{title}': Error - {str(e)[:150]}")
-                try:
-                    await status_msg.edit_text(f"Error processing PDF {pdf_label}:\n{e}")
-                    await asyncio.sleep(3)
-                except Exception:
-                    pass
-            finally:
-                try:
-                    if os.path.exists(pdf_path):
-                        os.remove(pdf_path)
-                except OSError:
-                    pass
-
-        # --- Handle Videos ---
-        is_video_item = (material_type == "VIDEO") or bool(item.get("video_id")) or (not pdf_urls and material_type != "PDF")
-        if is_video_item:
-            video_url, resolve_err = await asyncio.to_thread(_resolve_video_url, item, course_id)
-            if not video_url:
-                print(f"[BATCH] No video URL found for item {item_id}: {title} ({resolve_err})")
-                if not pdf_urls:
-                    fail_count += 1
-                    failed_reasons.append(f"Video '{title}': {resolve_err}")
-                continue
-
-            try:
-                vid_label = f"{title}"
-                task_id = f"batch_vid_{item_id}_{int(time.time())}"
-                vid_filename = f"{vid_label}.mp4".replace("/", "-").replace("\\", "-").replace(":", "-").replace("*", "")
-                vid_path = str(DOWNLOAD_DIR / vid_filename)
-
-                progress_data[task_id] = {
-                    "phase": f"Downloading Video...\n{vid_label}",
-                    "current": 0,
-                    "total": 0,
-                }
-
-                updater = asyncio.create_task(_progress_loop(status_msg, task_id))
-                success, err = await _download_video(video_url, vid_path, task_id)
-
-                if not success or not os.path.exists(vid_path) or os.path.getsize(vid_path) == 0:
-                    progress_data.pop(task_id, None)
-                    updater.cancel()
-                    fail_count += 1
-                    failed_reasons.append(f"Video '{title}': Download failed - {err[:150]}")
-                    try:
-                        await status_msg.edit_text(f"Video download failed for {vid_label}:\n{err[:300]}")
-                        await asyncio.sleep(3)
-                    except Exception:
-                        pass
-                    continue
-
-                file_size = os.path.getsize(vid_path)
-                progress_data[task_id] = {
-                    "phase": f"Uploading Video...\n{vid_label}",
-                    "current": 0,
-                    "total": file_size,
-                }
-
-                duration, width, height = await asyncio.to_thread(_get_video_metadata, vid_path)
-                thumb_path = str(DOWNLOAD_DIR / f"thumb_{task_id}.jpg")
-                thumb_file = await asyncio.to_thread(_generate_thumbnail, vid_path, thumb_path)
-
-                try:
-                    await client.send_video(
-                        chat_id=message.chat.id,
-                        video=vid_path,
-                        file_name=vid_filename,
-                        caption=vid_label,
-                        duration=duration,
-                        width=width,
-                        height=height,
-                        thumb=thumb_file,
-                        supports_streaming=True,
-                        progress=_upload_progress,
-                        progress_args=(task_id,),
-                    )
-                finally:
-                    if thumb_file and os.path.exists(thumb_file):
-                        try:
-                            os.remove(thumb_file)
-                        except OSError:
-                            pass
-
-                progress_data.pop(task_id, None)
-                updater.cancel()
-                success_count += 1
-
-            except Exception as e:
-                fail_count += 1
-                failed_reasons.append(f"Video '{title}': Exception - {str(e)[:150]}")
-                try:
-                    await status_msg.edit_text(f"Error processing video {vid_label}:\n{e}")
-                    await asyncio.sleep(3)
-                except Exception:
-                    pass
-            finally:
-                try:
-                    if os.path.exists(vid_path):
-                        os.remove(vid_path)
-                except OSError:
-                    pass
-
-    # Final summary
-    summary = (
-        f"Batch complete...\n\n"
-        f"Total: {total}\n"
-        f"Done: {success_count}\n"
-        f"Failed: {fail_count}"
-    )
-    if failed_reasons:
-        summary += "\n\nFailures detail:\n" + "\n".join(f"• {r}" for r in failed_reasons)
-
-    if len(summary) > 4000:
-        summary = summary[:3900] + "\n\n...[truncated]"
-
-    try:
-        await status_msg.edit_text(summary)
-    except Exception:
-        pass
-
-
-# ---------------------------------------------------------------------------
-# Callback Query Handler (for cancellation)
-# ---------------------------------------------------------------------------
-
-@app.on_callback_query(filters.regex(r"^cancel_"))
-async def handle_cancel_task(client, callback_query: CallbackQuery):
-    task_id = callback_query.data.split("cancel_", 1)[1]
-    cancelled_tasks.add(task_id)
-    
-    # Kill subprocess if any
-    proc = active_processes.get(task_id)
-    if proc:
-        try:
-            proc.kill()
-        except OSError:
-            pass
+        if process.returncode != 0:
+            err = (await process.stderr.read()).decode("utf-8", errors="ignore")
+            return False, err or "yt-dlp video download failed"
             
-    await callback_query.answer()
+        return True, ""
+    except Exception as e:
+        active_processes.pop(task_id, None)
+        return False, str(e)
+
+# ---------------------------------------------------------------------------
+# Video Metadata & Thumbnail Generators
+# ---------------------------------------------------------------------------
+
+def get_video_metadata(filepath: str) -> Tuple[int, int, int]:
+    """Extract duration, width, height using ffprobe."""
+    duration, width, height = 0, 0, 0
     try:
-        msg_text = callback_query.message.text or "Task"
-        await callback_query.message.edit_text(f"{msg_text}\n\nTask Cancelled")
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration:stream=width,height",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            filepath
+        ]
+        res = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8").splitlines()
+        if len(res) >= 1:
+            try:
+                width = int(res[0])
+            except ValueError:
+                pass
+        if len(res) >= 2:
+            try:
+                height = int(res[1])
+            except ValueError:
+                pass
+        if len(res) >= 3:
+            try:
+                duration = int(float(res[2]))
+            except ValueError:
+                pass
     except Exception:
         pass
+    return duration, width, height
 
-
-# ---------------------------------------------------------------------------
-# /setheaders, /headers, /clearheaders
-# ---------------------------------------------------------------------------
-
-
-@app.on_message(owner_filter & filters.command("setheaders"))
-async def handle_setheaders(client, message):
-    """Set custom headers from message text.
-
-    Usage: /setheaders
-    Header1: value1
-    Header2: value2
-    """
-    global custom_headers
-    lines = message.text.split("\n")[1:]  # Skip the /setheaders line
-    if not lines:
-        await message.reply_text(
-            "Usage:\n\n/setheaders\n"
-            "Cookie: your_cookie_here\n"
-            "Authorization: Bearer token\n\n"
-            "Paste headers from 1DM download details (one per line)."
-        )
-        return
-
-    parsed = {}
-    for line in lines:
-        line = line.strip()
-        if not line or ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        parsed[key.strip()] = value.strip()
-
-    if not parsed:
-        await message.reply_text("No valid headers found. Format: Key: Value")
-        return
-
-    custom_headers = parsed
-    _save_custom_headers()
-
-    header_list = "\n".join(f"{k}: {v[:50]}..." if len(v) > 50 else f"{k}: {v}" for k, v in parsed.items())
-    await message.reply_text(f"Saved {len(parsed)} custom headers:\n\n{header_list}")
-
-
-@app.on_message(owner_filter & filters.command("headers"))
-async def handle_headers(client, message):
-    all_h = _get_all_headers()
-    if not all_h:
-        await message.reply_text("No headers set.")
-        return
-
-    lines = []
-    for k, v in all_h.items():
-        tag = " [custom]" if k in custom_headers else " [default]"
-        display_v = v[:60] + "..." if len(v) > 60 else v
-        lines.append(f"{k}: {display_v}{tag}")
-
-    await message.reply_text("Current headers:\n\n" + "\n".join(lines))
-
-
-@app.on_message(owner_filter & filters.command("clearheaders"))
-async def handle_clearheaders(client, message):
-    global custom_headers
-    custom_headers = {}
-    if HEADERS_FILE.exists():
-        HEADERS_FILE.unlink()
-    await message.reply_text("Custom headers cleared. Only default headers remain.")
-
-
-# ---------------------------------------------------------------------------
-# /test command  (debug URL accessibility from server)
-# ---------------------------------------------------------------------------
-
-
-@app.on_message(owner_filter & filters.command("test"))
-async def handle_test(client, message):
-    """Run curl from the server to debug URL accessibility."""
-    url = extract_url(message.text)
-    if not url:
-        await message.reply_text("Send /test <url>")
-        return
-
-    status = await message.reply_text("Testing URL from server...")
-
-    # Test 1: curl with all headers (default + custom), show response body
-    all_h = _get_all_headers()
-    curl_cmd = [
-        "curl", "-sS",
-        "-w", "\n---\nHTTP %{http_code} | Size: %{size_download}B | IP: %{remote_ip}",
-    ]
-    for hk, hv in all_h.items():
-        curl_cmd += ["-H", f"{hk}: {hv}"]
-    curl_cmd += ["--max-time", "15", url]
-
-    result = await asyncio.create_subprocess_exec(
-        *curl_cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await result.communicate()
-    body_and_stats = stdout.decode(errors="replace").strip()
-
-    # Test 2: try URL without &bitrate= parameter
-    clean_url = re.sub(r"[&?]bitrate=\d+", "", url)
-    custom_tag = f"\nCustom headers: {len(custom_headers)}" if custom_headers else ""
-    alt_result = ""
-    if clean_url != url:
-        curl_cmd2 = [
-            "curl", "-sS",
-            "-w", "\n---\nHTTP %{http_code} | Size: %{size_download}B",
-            "-H", f"User-Agent: {HEADERS['User-Agent']}",
-            "-H", f"Referer: {HEADERS['Referer']}",
-            "-H", f"Origin: {HEADERS['Origin']}",
-            "--max-time", "15",
-            clean_url,
+def generate_thumbnail(video_path: str, thumb_path: str) -> str:
+    """Generate thumbnail image from video."""
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-ss", "00:00:02",
+            "-i", video_path, "-vframes", "1",
+            "-vf", "scale=320:-1", thumb_path
         ]
-        r2 = await asyncio.create_subprocess_exec(
-            *curl_cmd2,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        s2, _ = await r2.communicate()
-        alt_result = f"\n\nWithout bitrate param:\n{s2.decode(errors='replace').strip()}"
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        if os.path.exists(thumb_path):
+            return thumb_path
+    except Exception:
+        pass
+    return ""
 
-    text = f"Full URL:{custom_tag}\n{body_and_stats}{alt_result}"
-    if len(text) > 4000:
-        text = text[:4000] + "..."
+# ---------------------------------------------------------------------------
+# Command Handlers (/start, /update, /upate, /stop, /cancel)
+# ---------------------------------------------------------------------------
 
-    await status.edit_text(text)
-
-
-RESTART_FILE = BASE_DIR / "restart_info.json"
-
-
-@app.on_message(owner_filter & filters.command("update"))
-async def handle_update(client, message):
-    status = await message.reply_text("Pulling from GitHub...")
-
-    result = subprocess.run(
-        ["git", "pull"],
-        capture_output=True,
-        text=True,
-        cwd=str(BASE_DIR),
+@app.on_message(filters.command("start"))
+async def start_cmd(client: Client, message: Message):
+    """Start command handler."""
+    user = message.from_user
+    mention = user.mention if user else "User"
+    welcome_text = (
+        f"👋 **Hello {mention}!**\n\n"
+        f"🚀 **Welcome to PDF & Video Downloader Bot**\n\n"
+        f"📌 **Supported Links:**\n"
+        f"• 📄 **PDF Documents** (Direct PDF, Google Drive PDF, ClassX encrypted PDF)\n"
+        f"• 🎥 **Video Streams** (YouTube, m3u8, MP4, ClassX/Appx DRM, Drive Video)\n\n"
+        f"💡 **Usage Guide:**\n"
+        f"1️⃣ Upload a `.txt` file containing `Name : URL` or `URL` links.\n"
+        f"2️⃣ Or send a direct PDF or Video URL in chat.\n"
+        f"3️⃣ Choose range & video resolution to start processing!\n\n"
+        f"⚡ *Multi-part parallel fast uploader active.*"
     )
+    buttons = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📜 Help & Guide", callback_data="help_menu"),
+            InlineKeyboardButton("⚡ Commands", callback_data="commands_menu")
+        ],
+        [
+            InlineKeyboardButton("🔄 Update Bot", callback_data="update_bot"),
+            InlineKeyboardButton("👨‍💻 Owner", user_id=OWNER_ID if OWNER_ID else 1934839437)
+        ]
+    ])
+    await message.reply_text(welcome_text, reply_markup=buttons)
 
-    output = (result.stdout.strip() or result.stderr.strip() or "No output")
-    await status.edit_text(f"Update result:\n\n{output}\n\nRestarting...")
-
-    try:
-        restart_info = {
-            "chat_id": message.chat.id,
-            "reply_to": status.id,
-            "action": "update",
-            "output": output,
-        }
-        RESTART_FILE.write_text(json.dumps(restart_info, indent=2))
-    except Exception as e:
-        print(f"[UPDATE] Error saving restart info: {e}")
-
-    await asyncio.sleep(1)
-    os.execv(sys.executable, [sys.executable] + sys.argv)
-
-
-@app.on_message(owner_filter & filters.command("restart"))
-async def handle_restart(client, message):
-    status = await message.reply_text("Restarting bot process...")
-
-    try:
-        restart_info = {
-            "chat_id": message.chat.id,
-            "reply_to": status.id,
-            "action": "restart",
-            "output": "Manual restart",
-        }
-        RESTART_FILE.write_text(json.dumps(restart_info, indent=2))
-    except Exception as e:
-        print(f"[RESTART] Error saving restart info: {e}")
-
-    await asyncio.sleep(1)
-    os.execv(sys.executable, [sys.executable] + sys.argv)
-
-
-# ---------------------------------------------------------------------------
-# Caption editor handler  (Reply to bot's video/pdf to edit caption)
-# ---------------------------------------------------------------------------
-
-
-@app.on_message(owner_filter & filters.reply & filters.text & ~filters.command(["update", "restart", "start", "test", "setheaders", "headers", "clearheaders", "setapi", "api", "clearapi", "batch", "help"]))
-async def handle_caption_edit(client, message):
-    reply_msg = message.reply_to_message
-    if not reply_msg:
+@app.on_message(filters.command(["update", "upate"]))
+async def update_cmd(client: Client, message: Message):
+    """Update command handler to pull code, upgrade yt-dlp, and restart."""
+    if OWNER_ID and message.from_user.id != OWNER_ID:
+        await message.reply_text("❌ Only the bot owner can execute `/update` command.")
         return
+        
+    msg = await message.reply_text("🔄 **Starting Bot Update...**\n\n1️⃣ Pulling latest code via Git...")
+    
+    git_out = ""
+    try:
+        res = subprocess.run(["git", "pull"], capture_output=True, text=True, timeout=30)
+        git_out = res.stdout or res.stderr
+    except Exception as e:
+        git_out = f"Git error: {e}"
+        
+    await msg.edit_text(f"🔄 **Upgrading yt-dlp...**\n\nGit output:\n`{git_out[:300]}`")
+    
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"], capture_output=True, timeout=60)
+    except Exception:
+        pass
+        
+    await msg.edit_text("✅ **Update complete! Restarting process...**")
+    
+    # Save notification state
+    RESTART_FILE.write_text(json.dumps({"chat_id": message.chat.id, "time": time.time()}))
+    
+    # Restart python script
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
-    # Check if replied message is sent by bot and has media
-    me = await client.get_me()
-    is_bot_msg = reply_msg.from_user and reply_msg.from_user.id == me.id
-    has_media = bool(reply_msg.video or reply_msg.document or reply_msg.photo or reply_msg.audio or reply_msg.animation)
+@app.on_message(filters.command(["stop", "cancel"]))
+async def cancel_cmd(client: Client, message: Message):
+    """Cancel ongoing download tasks."""
+    user_id = message.from_user.id
+    if user_id in user_states:
+        user_states.pop(user_id, None)
+        await message.reply_text("🛑 Active setup state cleared.")
+    
+    cancelled = False
+    for task_id in list(progress_data.keys()):
+        if task_id.startswith(str(message.chat.id)):
+            cancelled_tasks.add(task_id)
+            if task_id in active_processes:
+                try:
+                    active_processes[task_id].kill()
+                except Exception:
+                    pass
+            cancelled = True
+            
+    if cancelled:
+        await message.reply_text("🛑 Stopped active download task!")
+    else:
+        await message.reply_text("ℹ️ No active task running.")
 
-    if is_bot_msg and has_media:
-        new_caption = message.text.strip()
-        try:
-            await client.edit_message_caption(
-                chat_id=message.chat.id,
-                message_id=reply_msg.id,
-                caption=new_caption,
-            )
-            confirm = await message.reply_text("Caption updated!")
-            await asyncio.sleep(3)
+# ---------------------------------------------------------------------------
+# Callback Query Handler
+# ---------------------------------------------------------------------------
+
+@app.on_callback_query()
+async def callback_handler(client: Client, query: CallbackQuery):
+    data = query.data
+    user_id = query.from_user.id
+    
+    if data == "help_menu":
+        text = (
+            "📖 **Help & Instructions**\n\n"
+            "• **Batch Downloading:** Send a `.txt` file formatted with links:\n"
+            "  `Topic Name : https://example.com/video.m3u8`\n"
+            "  `Document Title : https://example.com/file.pdf`\n\n"
+            "• **Single Download:** Send any direct PDF or Video link in chat.\n"
+            "• **Supported Types:** PDF documents & Video streams.\n"
+            "• **Cancel:** Click ⛔ Stop on progress card or send `/stop`."
+        )
+        buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="start_menu")]])
+        await query.message.edit_text(text, reply_markup=buttons)
+        
+    elif data == "commands_menu":
+        text = (
+            "⚡ **Available Commands:**\n\n"
+            "• `/start` - Launch interactive bot menu\n"
+            "• `/update` (or `/upate`) - Pull updates & restart bot\n"
+            "• `/stop` (or `/cancel`) - Cancel current active task"
+        )
+        buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="start_menu")]])
+        await query.message.edit_text(text, reply_markup=buttons)
+        
+    elif data == "start_menu":
+        mention = query.from_user.mention
+        welcome_text = (
+            f"👋 **Hello {mention}!**\n\n"
+            f"🚀 **Welcome to PDF & Video Downloader Bot**\n\n"
+            f"📌 **Supported Links:**\n"
+            f"• 📄 **PDF Documents**\n"
+            f"• 🎥 **Video Streams**\n\n"
+            f"Send a `.txt` file or link to get started!"
+        )
+        buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📜 Help & Guide", callback_data="help_menu"),
+                InlineKeyboardButton("⚡ Commands", callback_data="commands_menu")
+            ],
+            [
+                InlineKeyboardButton("🔄 Update Bot", callback_data="update_bot"),
+                InlineKeyboardButton("👨‍💻 Owner", user_id=OWNER_ID if OWNER_ID else 1934839437)
+            ]
+        ])
+        await query.message.edit_text(welcome_text, reply_markup=buttons)
+        
+    elif data == "update_bot":
+        if OWNER_ID and user_id != OWNER_ID:
+            await query.answer("❌ Owner only command", show_alert=True)
+            return
+        await query.answer("Starting update process...")
+        await update_cmd(client, query.message)
+        
+    elif data.startswith("cancel_"):
+        task_id = data.replace("cancel_", "")
+        cancelled_tasks.add(task_id)
+        if task_id in active_processes:
             try:
-                await confirm.delete()
+                active_processes[task_id].kill()
             except Exception:
                 pass
-        except Exception as e:
-            await message.reply_text(f"Failed to update caption: {e}")
+        await query.answer("🛑 Task cancellation requested!", show_alert=True)
+        
+    elif data.startswith("res_"):
+        res = data.replace("res_", "")
+        state = user_states.get(user_id)
+        if state and state.get("step") == "awaiting_quality":
+            state["quality"] = res
+            state["step"] = "processing"
+            await query.message.delete()
+            asyncio.create_task(run_batch_download(client, query.message, state))
+
+# ---------------------------------------------------------------------------
+# Message Handlers (Documents / TXT & Links)
+# ---------------------------------------------------------------------------
+
+@app.on_message(filters.document)
+async def document_handler(client: Client, message: Message):
+    doc = message.document
+    if not doc.file_name.endswith(".txt"):
+        await message.reply_text("❌ Please send a `.txt` file containing PDF or Video links.")
         return
+        
+    status_msg = await message.reply_text("📥 Reading TXT file...")
+    txt_path = await message.download(file_name=str(DOWNLOAD_DIR / f"{message.id}.txt"))
+    
+    with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = [l.strip() for l in f.readlines() if l.strip()]
+        
+    try:
+        os.remove(txt_path)
+    except OSError:
+        pass
+        
+    if not lines:
+        await status_msg.edit_text("❌ The uploaded TXT file is empty.")
+        return
+        
+    items = []
+    for idx, line in enumerate(lines, 1):
+        if ":" in line and not line.startswith("http"):
+            parts = line.split(":", 1)
+            name = parts[0].strip()
+            url = parts[1].strip()
+        else:
+            name = f"File {idx}"
+            url = line.strip()
+            
+        if url.startswith("http") or url.startswith("https") or ":" in url:
+            items.append({"index": idx, "name": name, "url": url})
+            
+    if not items:
+        await status_msg.edit_text("❌ No valid links found in the uploaded file.")
+        return
+        
+    user_id = message.from_user.id
+    user_states[user_id] = {
+        "chat_id": message.chat.id,
+        "items": items,
+        "total": len(items),
+        "step": "awaiting_range"
+    }
+    
+    await status_msg.edit_text(
+        f"📑 **Found {len(items)} links in file.**\n\n"
+        f"Send the start & end range in format `start-end` or single number.\n"
+        f"Example: `1-{len(items)}` or `1-10`"
+    )
 
-
-# ---------------------------------------------------------------------------
-# Link handler  (video download + upload)
-# ---------------------------------------------------------------------------
-
-
-@app.on_message(owner_filter & filters.text & ~filters.command(["update", "restart", "start", "test", "setheaders", "headers", "clearheaders", "setapi", "api", "clearapi", "batch", "help"]))
-async def handle_link(client, message):
-    # If this message was a reply that edited a caption, don't treat it as a video link
-    if message.reply_to_message:
-        me = await client.get_me()
-        if message.reply_to_message.from_user and message.reply_to_message.from_user.id == me.id:
-            if message.reply_to_message.video or message.reply_to_message.document:
+@app.on_message(filters.text & ~filters.command(["start", "update", "upate", "stop", "cancel"]))
+async def text_handler(client: Client, message: Message):
+    user_id = message.from_user.id
+    state = user_states.get(user_id)
+    text = message.text.strip()
+    
+    # 1. Range Selection State
+    if state and state.get("step") == "awaiting_range":
+        items = state["items"]
+        total = state["total"]
+        
+        start_idx = 1
+        end_idx = total
+        
+        if "-" in text:
+            try:
+                p = text.split("-")
+                start_idx = int(p[0].strip())
+                end_idx = int(p[1].strip())
+            except ValueError:
+                await message.reply_text(f"❌ Invalid range format. Send like `1-{total}`.")
                 return
-    url = extract_url(message.text)
-    if url is None:
-        return
-
-    if not is_supported_url(url):
-        return
-
-    is_pdf = is_pdf_url(url)
-
-    # Check token expiry before wasting time
-    expired, expiry_str = check_token_expiry(url)
-    print(f"[LINK] Received URL, expired={expired}, expiry={expiry_str}")
-
-    if expired:
+        else:
+            try:
+                start_idx = int(text)
+                end_idx = total
+            except ValueError:
+                await message.reply_text(f"❌ Invalid range number. Send like `1-{total}`.")
+                return
+                
+        start_idx = max(1, min(start_idx, total))
+        end_idx = max(start_idx, min(end_idx, total))
+        
+        selected_items = items[start_idx-1:end_idx]
+        state["selected_items"] = selected_items
+        state["step"] = "awaiting_quality"
+        
+        quality_markup = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📱 360p", callback_data="res_360"),
+                InlineKeyboardButton("💻 480p", callback_data="res_480")
+            ],
+            [
+                InlineKeyboardButton("📺 720p HD", callback_data="res_720"),
+                InlineKeyboardButton("🖥️ 1080p FHD", callback_data="res_1080")
+            ]
+        ])
         await message.reply_text(
-            f"Link Expired...\n\n{expiry_str}\n\n"
-            "Send a fresh link..."
+            f"✅ **Selected Range:** {start_idx} to {end_idx} ({len(selected_items)} items)\n\n"
+            f"🎬 **Select Video Resolution:**",
+            reply_markup=quality_markup
         )
         return
-
-    if expiry_str:
-        print(f"[LINK] Token valid until: {expiry_str}")
-
-    task_id = f"{message.chat.id}_{message.id}_{int(time.time())}"
-    if is_pdf:
-        filename = f"document_{message.id}_{int(time.time())}.pdf"
+        
+    # 2. Direct Link Input (Single or Multi-line links)
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    valid_items = []
+    
+    for idx, line in enumerate(lines, 1):
+        if ":" in line and not line.startswith("http"):
+            parts = line.split(":", 1)
+            name = parts[0].strip()
+            url = parts[1].strip()
+        else:
+            name = f"File_{int(time.time())}_{idx}"
+            url = line
+            
+        if url.startswith("http://") or url.startswith("https://") or ":" in url:
+            valid_items.append({"index": idx, "name": name, "url": url})
+            
+    if valid_items:
+        if len(valid_items) == 1:
+            # Single link: start processing immediately!
+            asyncio.create_task(process_single_item(client, message.chat.id, valid_items[0], quality="720"))
+        else:
+            # Multi-line links sent in text: process batch directly!
+            state = {
+                "chat_id": message.chat.id,
+                "selected_items": valid_items,
+                "quality": "720"
+            }
+            asyncio.create_task(run_batch_download(client, message, state))
+        return
     else:
-        filename = f"video_{message.id}_{int(time.time())}.mp4"
-    output_path = str(DOWNLOAD_DIR / filename)
+        await message.reply_text("❌ Please send a valid PDF or Video URL.")
 
-    # -- Download phase ----------------------------------------------------
+# ---------------------------------------------------------------------------
+# Processing Engine (PDF & Video Download & Upload)
+# ---------------------------------------------------------------------------
 
-    status_msg = await message.reply_text("Downloading...\n\n0 B")
-
-    progress_data[task_id] = {
-        "phase": "Downloading...",
-        "current": 0,
-        "total": 0,
-    }
-
-    updater = asyncio.create_task(_progress_loop(status_msg, task_id))
-
+async def process_single_item(client: Client, chat_id: int, item: Dict[str, Any], quality: str = "720"):
+    """Process a single PDF or Video link item."""
+    name = item.get("name", "File")
+    raw_url = item.get("url", "")
+    url = decrypt_classx_url(raw_url)
+    task_id = f"{chat_id}_{item['index']}_{int(time.time())}"
+    
+    is_pdf = is_pdf_url(url)
+    ext = ".pdf" if is_pdf else ".mp4"
+    safe_name = re.sub(r'[\\/*?:"<>|]', "", name).strip() or "file"
+    filename = f"{safe_name}{ext}"
+    output_path = str(DOWNLOAD_DIR / f"{task_id}{ext}")
+    
+    status_msg = await client.send_message(chat_id, f"⌛ **Starting download for:** `{name}`")
+    updater = asyncio.create_task(_progress_loop(status_msg, task_id, title=name))
+    
     try:
         if is_pdf:
-            success, error_text = await _download_direct(url, output_path, task_id)
+            success, err = await download_pdf(url, output_path, task_id)
         else:
-            stream_url = await asyncio.to_thread(_extract_stream_from_secure_player, url)
-            success, error_text = await _download_video(stream_url, output_path, task_id)
-
+            success, err = await download_video(url, output_path, task_id, quality=quality)
+            
         if not success:
+            progress_data.pop(task_id, None)
             updater.cancel()
-            # Truncate error to fit Telegram message limit
-            if len(error_text) > 3500:
-                error_text = error_text[:3500] + "..."
-            await status_msg.edit_text(f"Download failed...\n\n{error_text}")
+            await status_msg.edit_text(f"❌ **Download Failed:** `{name}`\n\n`{err[:1000]}`")
             return
-
+            
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            progress_data.pop(task_id, None)
+            updater.cancel()
+            await status_msg.edit_text("❌ **Error:** Downloaded file is empty.")
+            return
+            
         file_size = os.path.getsize(output_path)
-
-        if file_size == 0:
-            updater.cancel()
-            await status_msg.edit_text("Download failed: file is empty...")
-            return
-
-        # -- Upload phase --------------------------------------------------
-
-        progress_data[task_id] = {
-            "phase": "Uploading...",
-            "current": 0,
-            "total": file_size,
-        }
-
-        # The updater task is still running; it will now pick up the new phase.
-
+        progress_data[task_id] = {"phase": "Uploading to Telegram...", "current": 0, "total": file_size}
+        
+        async def upload_prog(current, total, t_id):
+            if t_id in progress_data:
+                progress_data[t_id]["current"] = current
+                
         if is_pdf:
             await client.send_document(
-                chat_id=message.chat.id,
+                chat_id=chat_id,
                 document=output_path,
                 file_name=filename,
-                progress=_upload_progress,
-                progress_args=(task_id,),
+                caption=f"📄 **{name}**",
+                progress=upload_prog,
+                progress_args=(task_id,)
             )
         else:
-            duration, width, height = await asyncio.to_thread(_get_video_metadata, output_path)
-            thumb_path = str(DOWNLOAD_DIR / f"thumb_{task_id}.jpg")
-            thumb_file = await asyncio.to_thread(_generate_thumbnail, output_path, thumb_path)
-
+            duration, width, height = await asyncio.to_thread(get_video_metadata, output_path)
+            thumb_file = str(DOWNLOAD_DIR / f"thumb_{task_id}.jpg")
+            thumb = await asyncio.to_thread(generate_thumbnail, output_path, thumb_file)
+            
             try:
                 await client.send_video(
-                    chat_id=message.chat.id,
+                    chat_id=chat_id,
                     video=output_path,
                     file_name=filename,
                     duration=duration,
                     width=width,
                     height=height,
-                    thumb=thumb_file,
+                    thumb=thumb if thumb and os.path.exists(thumb) else None,
+                    caption=f"🎥 **{name}** [{quality}p]",
                     supports_streaming=True,
-                    progress=_upload_progress,
-                    progress_args=(task_id,),
+                    progress=upload_prog,
+                    progress_args=(task_id,)
                 )
             finally:
-                if thumb_file and os.path.exists(thumb_file):
+                if thumb and os.path.exists(thumb):
                     try:
-                        os.remove(thumb_file)
+                        os.remove(thumb)
                     except OSError:
                         pass
 
-        # -- Done ----------------------------------------------------------
-
         progress_data.pop(task_id, None)
         updater.cancel()
-
-        # Delete the status message as requested by user
+        
         try:
             await status_msg.delete()
         except Exception:
             pass
 
-    except Exception as exc:
+    except Exception as e:
         progress_data.pop(task_id, None)
         updater.cancel()
-        await status_msg.edit_text(f"Error...\n\n{exc}")
-
+        await status_msg.edit_text(f"❌ **Error processing `{name}`:**\n`{e}`")
     finally:
-        # Always clean up the local file
-        try:
-            if os.path.exists(output_path):
+        if os.path.exists(output_path):
+            try:
                 os.remove(output_path)
-        except OSError:
-            pass
+            except OSError:
+                pass
 
+async def run_batch_download(client: Client, message: Message, state: Dict[str, Any]):
+    """Run batch download loop for selected items."""
+    chat_id = state["chat_id"]
+    items = state["selected_items"]
+    quality = state.get("quality", "720")
+    total = len(items)
+    
+    summary_msg = await client.send_message(chat_id, f"🚀 **Starting Batch Processing ({total} items)...**")
+    
+    for i, item in enumerate(items, 1):
+        if any(task.startswith(str(chat_id)) for task in cancelled_tasks):
+            await client.send_message(chat_id, "🛑 **Batch download cancelled by user.**")
+            break
+            
+        await process_single_item(client, chat_id, item, quality=quality)
+        await asyncio.sleep(1)
+        
+    await summary_msg.edit_text(f"✅ **Batch Completed!** Processed {total} item(s).")
 
-# Startup notification listener (runs on first update after restart)
+# ---------------------------------------------------------------------------
+# Restart Notification & Entry Point
+# ---------------------------------------------------------------------------
+
 @app.on_message(group=-1)
-async def _check_restart_notification(client, message):
+async def check_restart_notification(client: Client, message: Message):
     if RESTART_FILE.exists():
         try:
             data = json.loads(RESTART_FILE.read_text())
-            if RESTART_FILE.exists():
-                RESTART_FILE.unlink()
-
+            RESTART_FILE.unlink()
             chat_id = data.get("chat_id")
-            out = data.get("output", "")
-
-            msg = f"Restarted successfully!\n\nGit result:\n{out[:400]}"
             if chat_id:
-                await client.send_message(chat_id=chat_id, text=msg)
+                await client.send_message(chat_id, "✅ **Bot updated and restarted successfully!**")
         except Exception as e:
-            print(f"[STARTUP] Restart notification error: {e}")
-    
+            print(f"[RESTART] Notification error: {e}")
     message.continue_propagation()
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     if not BOT_TOKEN or not API_ID or not API_HASH:
         print("ERROR: BOT_TOKEN, API_ID, or API_HASH missing from .env")
         sys.exit(1)
 
-    print("Bot started. Listening for commands...")
+    print("Bot started successfully. Listening for commands...")
     app.run()
