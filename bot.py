@@ -330,26 +330,68 @@ def _decrypt_classx_url(encrypted_str):
         pass
     return ""
 
+def _find_url_in_dict(obj):
+    """Recursively search for a video URL or decryptable string in any dict or list."""
+    if isinstance(obj, dict):
+        priority_keys = [
+            "download_link", "video_url", "video_link", "encrypted_link",
+            "link", "url", "hls_url", "m3u8_url", "stream_url", "file_url",
+            "encrypted_link_360", "encrypted_link_480", "encrypted_link_720", "encrypted_link_1080",
+            "video_url_360", "video_url_480", "video_url_720", "video_url_1080",
+            "url_360", "url_480", "url_720", "url_1080", "path"
+        ]
+        for key in priority_keys:
+            if key in obj:
+                val = obj[key]
+                if isinstance(val, str) and val.strip():
+                    val = val.strip()
+                    if val.startswith("http"):
+                        return val
+                    dec = _decrypt_classx_url(val)
+                    if dec:
+                        return dec
+
+        for k, v in obj.items():
+            if k in ["lecture_summary_url", "image", "thumbnail", "photo", "icon", "banner"]:
+                continue
+
+            if isinstance(v, str) and v.strip():
+                v = v.strip()
+                if v.startswith("http"):
+                    if any(ext in v.lower() for ext in [".m3u8", ".mp4", "stream", "video", "hls", "akamai", "cdn", "appx"]):
+                        return v
+                else:
+                    dec = _decrypt_classx_url(v)
+                    if dec:
+                        return dec
+            elif isinstance(v, (dict, list)):
+                res = _find_url_in_dict(v)
+                if res:
+                    return res
+
+        for k, v in obj.items():
+            if k in ["lecture_summary_url", "image", "thumbnail", "photo", "icon", "banner"]:
+                continue
+            if isinstance(v, str) and v.startswith("http") and not any(v.lower().endswith(img_ext) for img_ext in [".png", ".jpg", ".jpeg", ".webp"]):
+                return v
+
+    elif isinstance(obj, list):
+        for item in obj:
+            res = _find_url_in_dict(item)
+            if res:
+                return res
+
+    return ""
+
 def _resolve_video_url(item_data, course_id):
     """Extract or fetch video URL for a given item.
 
     Returns (url: str, error_msg: str).
     """
-    direct_fields = [
-        "download_link", "video_link", "link", "url", "hls_url", "m3u8_url",
-        "encrypted_link", "encrypted_link_360", "encrypted_link_480", "encrypted_link_720", "encrypted_link_1080"
-    ]
-
-    # 1. Check direct fields on item
-    for field in direct_fields:
-        val = item_data.get(field, "")
-        if not val:
-            continue
-        if str(val).startswith("http"):
-            return str(val), ""
-        dec = _decrypt_classx_url(str(val))
-        if dec:
-            return dec, ""
+    # 1. Check direct fields on item_data first
+    url = _find_url_in_dict(item_data)
+    if url:
+        return url, ""
 
     # 2. Fetch video details via API if ID exists
     video_id = item_data.get("id") or item_data.get("video_id")
@@ -368,22 +410,15 @@ def _resolve_video_url(item_data, course_id):
             return "", f"API Error status {status}: {msg}"
 
         ddata = details.get("data", {})
-        if isinstance(ddata, list) and ddata:
-            ddata = ddata[0]
+        url = _find_url_in_dict(ddata)
+        if url:
+            return url, ""
 
         if isinstance(ddata, dict):
-            for field in direct_fields:
-                val = ddata.get(field, "")
-                if not val:
-                    continue
-                if str(val).startswith("http"):
-                    return str(val), ""
-                dec = _decrypt_classx_url(str(val))
-                if dec:
-                    return dec, ""
-
-            avail_keys = list(ddata.keys())
-            return "", f"No video link in API response (keys: {avail_keys[:8]})"
+            kv_sample = {k: str(v)[:30] for k, v in ddata.items() if v}
+            return "", f"No link in API data. KVs: {kv_sample}"
+        elif isinstance(ddata, list):
+            return "", f"API data list (len {len(ddata)}), no video link found"
         else:
             return "", f"API data empty or invalid: {type(ddata)}"
 
