@@ -383,6 +383,80 @@ def _find_url_in_dict(obj):
 
     return ""
 
+from urllib.parse import urlparse, parse_qs, unquote
+
+def _extract_stream_from_secure_player(url):
+    """If url is an Appx secure-player link, resolve the actual .m3u8 or .mp4 stream URL."""
+    if not url or not isinstance(url, str):
+        return url
+
+    if "secure-player" not in url.lower() and "player.appx" not in url.lower():
+        return url
+
+    print(f"[PLAYER] Resolving Appx player URL: {url}")
+    
+    # 1. Check query params for embedded url/link/file
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        for key in ["url", "link", "stream", "file", "src", "target"]:
+            if key in qs and qs[key]:
+                target = unquote(qs[key][0])
+                if target.startswith("http"):
+                    print(f"[PLAYER] Extracted target from query param '{key}': {target}")
+                    return target
+                dec = _decrypt_classx_url(target)
+                if dec:
+                    print(f"[PLAYER] Decrypted target from query param '{key}': {dec}")
+                    return dec
+    except Exception as e:
+        print(f"[PLAYER] Query param parse error: {e}")
+
+    # 2. Fetch HTML body of player page
+    try:
+        all_h = _get_all_headers()
+        req = Request(url)
+        for k, v in all_h.items():
+            req.add_header(k, v)
+        req.add_header("Referer", "https://appx-play.akamai.net.in/")
+
+        with urlopen(req, timeout=15) as resp:
+            raw_html = resp.read()
+            if resp.headers.get("Content-Encoding") == "gzip":
+                raw_html = gzip.decompress(raw_html)
+            html = raw_html.decode("utf-8", errors="replace")
+
+        # Search for direct .m3u8 or .mp4 links in HTML
+        m3u8_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html)
+        if m3u8_matches:
+            print(f"[PLAYER] Found m3u8 URL in HTML: {m3u8_matches[0]}")
+            return m3u8_matches[0]
+
+        mp4_matches = re.findall(r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*', html)
+        if mp4_matches:
+            print(f"[PLAYER] Found mp4 URL in HTML: {mp4_matches[0]}")
+            return mp4_matches[0]
+
+        # Search for file: "..." or source: "..." or hls: "..."
+        source_matches = re.findall(r'(?:file|source|src|url|hls)\s*:\s*["\'](https?://[^"\']+)["\']', html, re.IGNORECASE)
+        for src in source_matches:
+            if not any(src.lower().endswith(ext) for ext in [".js", ".css", ".png", ".jpg"]):
+                print(f"[PLAYER] Found source match in JS: {src}")
+                return src
+
+        # Check for encrypted strings in HTML
+        enc_matches = re.findall(r'["\']([A-Za-z0-9+/=]{40,})["\']', html)
+        for enc in enc_matches:
+            dec = _decrypt_classx_url(enc)
+            if dec:
+                print(f"[PLAYER] Decrypted stream URL from HTML: {dec}")
+                return dec
+
+    except Exception as e:
+        print(f"[PLAYER] Error fetching player page HTML: {e}")
+
+    return url
+
 def _resolve_video_url(item_data, course_id):
     """Extract or fetch video URL for a given item.
 
@@ -391,6 +465,7 @@ def _resolve_video_url(item_data, course_id):
     # 1. Check direct fields on item_data first
     url = _find_url_in_dict(item_data)
     if url:
+        url = _extract_stream_from_secure_player(url)
         return url, ""
 
     # 2. Fetch video details via API if ID exists
@@ -412,6 +487,7 @@ def _resolve_video_url(item_data, course_id):
         ddata = details.get("data", {})
         url = _find_url_in_dict(ddata)
         if url:
+            url = _extract_stream_from_secure_player(url)
             return url, ""
 
         if isinstance(ddata, dict):
@@ -470,7 +546,7 @@ def extract_url(text):
 
 def is_supported_url(url):
     """Check whether the URL looks like a supported video or document link."""
-    keywords = ["m3u8", "video", "stream", "mp4", "hls", ".ts", ".pdf"]
+    keywords = ["m3u8", "video", "stream", "mp4", "hls", ".ts", ".pdf", "player", "appx", "secure"]
     lower = url.lower()
     return any(kw in lower for kw in keywords)
 
@@ -1317,7 +1393,8 @@ async def handle_link(client, message):
         if is_pdf:
             success, error_text = await _download_direct(url, output_path, task_id)
         else:
-            success, error_text = await _download_video(url, output_path, task_id)
+            stream_url = await asyncio.to_thread(_extract_stream_from_secure_player, url)
+            success, error_text = await _download_video(stream_url, output_path, task_id)
 
         if not success:
             updater.cancel()
