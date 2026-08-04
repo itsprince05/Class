@@ -657,7 +657,12 @@ def check_url_accessible(url):
 
 
 def _owner_group_check(_, __, message):
-    return message.chat and message.chat.id == OWNER_GROUP
+    if not message or not message.chat:
+        return False
+    # Strictly respond ONLY in OWNER_GROUP
+    if message.chat.id == OWNER_GROUP:
+        return True
+    return False
 
 
 owner_filter = filters.create(_owner_group_check)
@@ -1554,37 +1559,35 @@ async def handle_link(client, message):
             pass
 
 
+# Startup notification listener (runs on first update after restart)
+@app.on_message(group=-1)
+async def _check_restart_notification(client, message):
+    if RESTART_FILE.exists():
+        try:
+            data = json.loads(RESTART_FILE.read_text())
+            if RESTART_FILE.exists():
+                RESTART_FILE.unlink()
+
+            chat_id = data.get("chat_id")
+            out = data.get("output", "")
+
+            msg = f"Restarted successfully!\n\nGit result:\n{out[:400]}"
+            if chat_id:
+                await client.send_message(chat_id=chat_id, text=msg)
+        except Exception as e:
+            print(f"[STARTUP] Restart notification error: {e}")
+    
+    message.continue_propagation()
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-async def main():
-    async with app:
-        print("Bot started. Listening in owner group only.")
-
-        # Check for pending restart notification
-        if RESTART_FILE.exists():
-            try:
-                data = json.loads(RESTART_FILE.read_text())
-                if RESTART_FILE.exists():
-                    RESTART_FILE.unlink()
-
-                chat_id = data.get("chat_id")
-                out = data.get("output", "")
-
-                msg = f"Restarted successfully!\n\nGit result:\n{out[:400]}"
-                if chat_id:
-                    await app.send_message(chat_id=chat_id, text=msg)
-            except Exception as e:
-                print(f"[STARTUP] Restart notification error: {e}")
-
-        await idle()
-
-
 if __name__ == "__main__":
-    # Quick sanity check
     if not BOT_TOKEN or not API_ID or not API_HASH:
         print("ERROR: BOT_TOKEN, API_ID, or API_HASH missing from .env")
         sys.exit(1)
 
-    asyncio.run(main())
+    print("Bot started. Listening for commands...")
+    app.run()
