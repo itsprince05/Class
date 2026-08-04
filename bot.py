@@ -63,82 +63,13 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 
 # ---------------------------------------------------------------------------
-# Pyrogram Fast Uploader (Parallel Multi-chunk Uploader)
+# Global State Tracking
 # ---------------------------------------------------------------------------
-
-original_save_file = Client.save_file
 
 cancelled_tasks = set()
 active_processes = {}
 user_states = {}
 progress_data = {}
-
-async def fast_save_file(self: Client, *args, **kwargs) -> Union[InputFile, InputFileBig]:
-    path = kwargs.get("path")
-    if path is None and len(args) > 0:
-        path = args[0]
-        
-    file_size = os.path.getsize(path)
-    file_id = kwargs.get("file_id")
-    progress = kwargs.get("progress")
-    progress_args = kwargs.get("progress_args", ())
-    
-    part_size = 1024 * 1024  # 1 MB chunk size
-    total_parts = math.ceil(file_size / part_size)
-    if file_id is None:
-        file_id = random.getrandbits(63)
-        
-    sem = asyncio.Semaphore(15)  # 15 concurrent upload connections
-    uploaded_bytes = 0
-    task_id = progress_args[0] if progress_args else None
-    
-    async def upload_part(part_index):
-        if task_id in cancelled_tasks:
-            raise Exception("Cancelled by user")
-            
-        nonlocal uploaded_bytes
-        async with sem:
-            if task_id in cancelled_tasks:
-                raise Exception("Cancelled by user")
-            with open(path, "rb") as f:
-                f.seek(part_index * part_size)
-                chunk = f.read(part_size)
-                
-            rpc = SaveBigFilePart(
-                file_id=file_id,
-                file_part=part_index,
-                file_total_parts=total_parts,
-                bytes=chunk
-            )
-            
-            for _ in range(5):
-                try:
-                    await self.invoke(rpc)
-                    break
-                except FloodWait as e:
-                    await asyncio.sleep(e.value + 1)
-                except Exception:
-                    await asyncio.sleep(2)
-            else:
-                raise Exception(f"Failed uploading part {part_index}")
-                
-            uploaded_bytes += len(chunk)
-            if progress:
-                if asyncio.iscoroutinefunction(progress):
-                    await progress(uploaded_bytes, file_size, *progress_args)
-                else:
-                    progress(uploaded_bytes, file_size, *progress_args)
-
-    tasks = [asyncio.create_task(upload_part(i)) for i in range(total_parts)]
-    await asyncio.gather(*tasks)
-
-    return InputFileBig(
-        id=file_id,
-        parts=total_parts,
-        name=Path(path).name
-    )
-
-Client.save_file = fast_save_file
 
 # ---------------------------------------------------------------------------
 # Configuration & Setup
@@ -266,21 +197,19 @@ async def _progress_loop(status_msg: Message, task_id: str, title: str = ""):
             speed = current / elapsed if elapsed > 0 else 0
             eta = (total - current) / speed if speed > 0 else 0
             
-            filled = int(pct // 10)
-            bar = "🟩" * filled + "⬜" * (10 - filled)
             text = (
-                f"📥 **{title or 'Downloading File'}**\n\n"
+                f"📥 **{title or 'Processing File'}**\n\n"
                 f"⚙️ **Status:** {phase}\n"
-                f"📊 **Progress:** [{bar}] {pct:.1f}%\n"
+                f"📊 **Progress:** {pct:.1f}%\n"
                 f"💾 **Size:** {format_bytes(current)} / {format_bytes(total)}\n"
                 f"🚀 **Speed:** {format_bytes(int(speed))}/s | ⏳ **ETA:** {get_readable_time(int(eta))}"
             )
         else:
             speed = current / elapsed if elapsed > 0 else 0
             text = (
-                f"📥 **{title or 'Downloading File'}**\n\n"
+                f"📥 **{title or 'Processing File'}**\n\n"
                 f"⚙️ **Status:** {phase}\n"
-                f"💾 **Downloaded:** {format_bytes(current)}\n"
+                f"💾 **Processed:** {format_bytes(current)}\n"
                 f"🚀 **Speed:** {format_bytes(int(speed))}/s | ⏱️ **Elapsed:** {get_readable_time(int(elapsed))}"
             )
             
@@ -352,12 +281,14 @@ async def download_video(url: str, output_path: str, task_id: str, quality: str 
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            limit=10 * 1024 * 1024  # 10 MB buffer limit
+            stderr=asyncio.subprocess.STDOUT,  # Combine stderr into stdout to prevent pipe buffer deadlock
+            limit=10 * 1024 * 1024
         )
         active_processes[task_id] = process
         progress_data[task_id] = {"phase": "Downloading Video...", "current": 0, "total": 0}
         
+        output_logs = []
+
         # Real-time disk size monitor fallback
         async def monitor_disk_size():
             out_file = Path(output_path)
@@ -399,6 +330,8 @@ async def download_video(url: str, output_path: str, task_id: str, quality: str 
             if not line:
                 break
             line_str = line.decode("utf-8", errors="ignore").strip()
+            if line_str:
+                output_logs.append(line_str)
             
             # Parse yt-dlp percentage lines with --newline
             match = re.search(r'\[download\]\s+(\d+\.?\d*)%\s+of\s+~?\s*(\d+\.?\d*)(\w+)', line_str)
@@ -418,8 +351,8 @@ async def download_video(url: str, output_path: str, task_id: str, quality: str 
         active_processes.pop(task_id, None)
         
         if process.returncode != 0:
-            err = (await process.stderr.read()).decode("utf-8", errors="ignore")
-            return False, err or "yt-dlp video download failed"
+            err_log = "\n".join(output_logs[-20:])
+            return False, err_log or "yt-dlp video download failed"
             
         return True, ""
     except Exception as e:
@@ -440,7 +373,7 @@ def get_video_metadata(filepath: str) -> Tuple[int, int, int]:
             "-of", "default=noprint_wrappers=1:nokey=1",
             filepath
         ]
-        res = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8").splitlines()
+        res = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=15).decode("utf-8").splitlines()
         if len(res) >= 1:
             try:
                 width = int(res[0])
