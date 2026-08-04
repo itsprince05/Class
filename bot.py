@@ -1693,12 +1693,53 @@ async def handle_restart(client, message):
 
 
 # ---------------------------------------------------------------------------
+# Caption editor handler  (Reply to bot's video/pdf to edit caption)
+# ---------------------------------------------------------------------------
+
+
+@app.on_message(owner_filter & filters.reply & filters.text & ~filters.command(["update", "restart", "start", "test", "setheaders", "headers", "clearheaders", "setapi", "api", "clearapi", "batch", "help"]))
+async def handle_caption_edit(client, message):
+    reply_msg = message.reply_to_message
+    if not reply_msg:
+        return
+
+    # Check if replied message is sent by bot and has media
+    me = await client.get_me()
+    is_bot_msg = reply_msg.from_user and reply_msg.from_user.id == me.id
+    has_media = bool(reply_msg.video or reply_msg.document or reply_msg.photo or reply_msg.audio or reply_msg.animation)
+
+    if is_bot_msg and has_media:
+        new_caption = message.text.strip()
+        try:
+            await client.edit_message_caption(
+                chat_id=message.chat.id,
+                message_id=reply_msg.id,
+                caption=new_caption,
+            )
+            confirm = await message.reply_text("Caption updated!")
+            await asyncio.sleep(3)
+            try:
+                await confirm.delete()
+            except Exception:
+                pass
+        except Exception as e:
+            await message.reply_text(f"Failed to update caption: {e}")
+        return
+
+
+# ---------------------------------------------------------------------------
 # Link handler  (video download + upload)
 # ---------------------------------------------------------------------------
 
 
 @app.on_message(owner_filter & filters.text & ~filters.command(["update", "restart", "start", "test", "setheaders", "headers", "clearheaders", "setapi", "api", "clearapi", "batch", "help"]))
 async def handle_link(client, message):
+    # If this message was a reply that edited a caption, don't treat it as a video link
+    if message.reply_to_message:
+        me = await client.get_me()
+        if message.reply_to_message.from_user and message.reply_to_message.from_user.id == me.id:
+            if message.reply_to_message.video or message.reply_to_message.document:
+                return
     url = extract_url(message.text)
     if url is None:
         return
