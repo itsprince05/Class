@@ -61,7 +61,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import FloodWait
 from dotenv import load_dotenv
@@ -1578,7 +1578,7 @@ async def main():
             except Exception as e:
                 print(f"[STARTUP] Restart notification error: {e}")
 
-        await asyncio.Event().wait()
+        await idle()
 
 
 if __name__ == "__main__":
