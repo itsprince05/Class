@@ -385,6 +385,50 @@ def _find_url_in_dict(obj):
 
 from urllib.parse import urlparse, parse_qs, unquote
 
+def _decode_jwt_or_base64(token_str):
+    """Try to decode JWT token payload or Base64 string to find video URLs."""
+    if not token_str or not isinstance(token_str, str):
+        return ""
+
+    # 1. Try AES decryption
+    dec = _decrypt_classx_url(token_str)
+    if dec:
+        return dec
+
+    # 2. Try JWT token (parts separated by dot)
+    if "." in token_str:
+        parts = token_str.split(".")
+        for part in parts:
+            if len(part) > 10:
+                try:
+                    part_b64 = part + "=" * ((4 - len(part) % 4) % 4)
+                    decoded_bytes = base64.urlsafe_b64decode(part_b64)
+                    decoded_str = decoded_bytes.decode("utf-8", errors="ignore")
+                    urls = re.findall(r'https?://[^\s"\'\\{}]+', decoded_str)
+                    for u in urls:
+                        if any(k in u.lower() for k in [".m3u8", ".mp4", "stream", "akamai", "cdn", "hls"]):
+                            return u
+                    if urls:
+                        return urls[0]
+                except Exception:
+                    pass
+
+    # 3. Try standard Base64
+    try:
+        b64 = token_str + "=" * ((4 - len(token_str) % 4) % 4)
+        decoded_bytes = base64.urlsafe_b64decode(b64)
+        decoded_str = decoded_bytes.decode("utf-8", errors="ignore")
+        urls = re.findall(r'https?://[^\s"\'\\{}]+', decoded_str)
+        for u in urls:
+            if any(k in u.lower() for k in [".m3u8", ".mp4", "stream", "akamai", "cdn", "hls"]):
+                return u
+        if urls:
+            return urls[0]
+    except Exception:
+        pass
+
+    return ""
+
 def _extract_stream_from_secure_player(url):
     """If url is an Appx secure-player link, resolve the actual .m3u8 or .mp4 stream URL."""
     if not url or not isinstance(url, str):
@@ -395,30 +439,31 @@ def _extract_stream_from_secure_player(url):
 
     print(f"[PLAYER] Resolving Appx player URL: {url}")
     
-    # 1. Check query params for embedded url/link/file
+    # 1. Check query params for embedded url/link/file/token
     try:
         parsed = urlparse(url)
         qs = parse_qs(parsed.query)
-        for key in ["url", "link", "stream", "file", "src", "target"]:
+        for key in ["token", "url", "link", "stream", "file", "src", "target", "data"]:
             if key in qs and qs[key]:
-                target = unquote(qs[key][0])
-                if target.startswith("http"):
-                    print(f"[PLAYER] Extracted target from query param '{key}': {target}")
-                    return target
-                dec = _decrypt_classx_url(target)
-                if dec:
-                    print(f"[PLAYER] Decrypted target from query param '{key}': {dec}")
-                    return dec
+                val = unquote(qs[key][0])
+                if val.startswith("http") and ("m3u8" in val or "mp4" in val or "akamai" in val):
+                    print(f"[PLAYER] Found direct URL in query param '{key}': {val}")
+                    return val
+                decoded = _decode_jwt_or_base64(val)
+                if decoded:
+                    print(f"[PLAYER] Decoded URL from query param '{key}': {decoded}")
+                    return decoded
     except Exception as e:
         print(f"[PLAYER] Query param parse error: {e}")
 
-    # 2. Fetch HTML body of player page
+    # 2. Fetch HTML body of player page with proper browser headers
     try:
         all_h = _get_all_headers()
         req = Request(url)
         for k, v in all_h.items():
             req.add_header(k, v)
-        req.add_header("Referer", "https://appx-play.akamai.net.in/")
+        req.add_header("Host", "player.appx.co.in")
+        req.add_header("Referer", "https://yodhaappapi.classx.co.in/")
 
         with urlopen(req, timeout=15) as resp:
             raw_html = resp.read()
@@ -444,13 +489,13 @@ def _extract_stream_from_secure_player(url):
                 print(f"[PLAYER] Found source match in JS: {src}")
                 return src
 
-        # Check for encrypted strings in HTML
-        enc_matches = re.findall(r'["\']([A-Za-z0-9+/=]{40,})["\']', html)
-        for enc in enc_matches:
-            dec = _decrypt_classx_url(enc)
-            if dec:
-                print(f"[PLAYER] Decrypted stream URL from HTML: {dec}")
-                return dec
+        # Check for encrypted / JWT strings in HTML
+        tokens_in_html = re.findall(r'["\'](eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)["\']', html)
+        for tok in tokens_in_html:
+            decoded = _decode_jwt_or_base64(tok)
+            if decoded:
+                print(f"[PLAYER] Decoded stream URL from HTML JWT: {decoded}")
+                return decoded
 
     except Exception as e:
         print(f"[PLAYER] Error fetching player page HTML: {e}")
