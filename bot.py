@@ -914,13 +914,21 @@ owner_filter = filters.create(_owner_group_check)
 # ---------------------------------------------------------------------------
 
 
-async def _progress_loop(status_msg, task_id):
-    """Edit the status message every 3 seconds with current progress.
+def _upload_progress(current, total, *args):
+    """Callback for Pyrogram upload progress updates."""
+    task_id = args[0] if args else None
+    if task_id and task_id in progress_data:
+        progress_data[task_id]["current"] = current
+        progress_data[task_id]["total"] = total
 
-    Runs as a fire-and-forget asyncio task so it never blocks or slows
-    down the actual download / upload happening in the main coroutine.
-    """
+
+async def _progress_loop(status_msg, task_id):
+    """Edit status message with clean format (Current MB / Total MB & Speed MB/s)."""
     last_text = ""
+    last_current = 0
+    last_time = time.time()
+    speed = 0.0
+
     while task_id in progress_data:
         info = progress_data.get(task_id)
         if info is None:
@@ -930,20 +938,42 @@ async def _progress_loop(status_msg, task_id):
         current = info.get("current", 0)
         total = info.get("total", 0)
 
+        now = time.time()
+        dt = now - last_time
+
+        if dt >= 1.0:
+            diff = current - last_current
+            if diff > 0:
+                speed = diff / dt
+            elif diff < 0:
+                speed = 0.0
+            last_current = current
+            last_time = now
+
+        speed_str = f"{format_bytes(speed)}/s" if speed > 0 else "0 B/s"
+
+        lines = [f"{phase}", ""]
+
         if total > 0:
-            text = f"{phase}\n\n{format_bytes(current)} / {format_bytes(total)}"
+            lines.append(f"{format_bytes(current)} / {format_bytes(total)}")
+            lines.append(f"Speed: {speed_str}")
         else:
-            text = f"{phase}\n\n{format_bytes(current)}"
+            lines.append(f"{format_bytes(current)}")
+            lines.append(f"Speed: {speed_str}")
+
+        text = "\n".join(lines)
 
         if text != last_text:
             try:
                 btn = InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"cancel_{task_id}")]])
                 await status_msg.edit_text(text, reply_markup=btn)
                 last_text = text
+            except FloodWait as e:
+                await asyncio.sleep(e.value + 1)
             except Exception:
                 pass
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
 
 
 # ---------------------------------------------------------------------------
