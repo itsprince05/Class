@@ -146,12 +146,15 @@ def _owner_group_check(_, __, message):
     if not message or not message.chat:
         return False
     cid = message.chat.id
-    # Match either configured OWNER_GROUP or OWNER_ID in private chat
-    is_allowed = (cid == OWNER_GROUP) or (OWNER_ID and cid == OWNER_ID)
+    user_id = message.from_user.id if message.from_user else None
+    txt = (message.text or message.caption or "")[:40]
+    
+    print(f"[RECV] Message in chat {cid} from user {user_id}: '{txt}'")
+    is_allowed = (cid == OWNER_GROUP) or (OWNER_ID and cid == OWNER_ID) or (user_id and user_id == OWNER_ID)
     if is_allowed:
-        print(f"[LISTEN] Allowed message from chat {cid}: {getattr(message, 'text', '')[:40]}")
+        print(f"[ALLOW] Authorized message from chat {cid}")
     else:
-        print(f"[LISTEN] Ignored message from unauthorized chat {cid}")
+        print(f"[DENY] Unauthorized message from chat {cid} (Target OWNER_GROUP={OWNER_GROUP}, OWNER_ID={OWNER_ID})")
     return is_allowed
 
 owner_filter = filters.create(_owner_group_check)
@@ -167,7 +170,8 @@ def format_bytes(size):
         idx += 1
     return f"{size:.2f} {units[idx]}"
 
-def extract_url(text):
+def extract_url(message):
+    text = (message.text or message.caption or "") if message else ""
     match = re.search(r"https?://\S+", text)
     return match.group(0) if match else None
 
@@ -384,7 +388,22 @@ async def handle_callback(client, callback):
 
 @app.on_message(owner_filter & filters.command("start"))
 async def handle_start(client, message):
-    await message.reply_text("Send direct video link (.m3u8) or PDF link (.pdf) to download!")
+    msg_text = (
+        "Direct Video & PDF Downloader Bot is Active!\n\n"
+        "How to use:\n"
+        "• Send any direct video link (`.m3u8` / `.mp4`)\n"
+        "• Send any direct PDF link (`.pdf`)\n\n"
+        "Features:\n"
+        "• High-speed 16-thread download (yt-dlp + aria2c)\n"
+        "• Instant video streaming playback (faststart)\n"
+        "• Auto cover thumbnail & video duration\n"
+        "• Fast Pyrogram uploader\n\n"
+        "Commands:\n"
+        "/start - Show this menu\n"
+        "/update - Pull latest code from GitHub & auto-restart\n"
+        "/restart - Restart bot process"
+    )
+    await message.reply_text(msg_text)
 
 @app.on_message(owner_filter & filters.command("update"))
 async def handle_update(client, message):
@@ -405,12 +424,14 @@ async def handle_restart(client, message):
     await asyncio.sleep(1)
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
-@app.on_message(owner_filter & filters.text & ~filters.command(["update", "restart", "start"]))
+@app.on_message(owner_filter & (filters.text | filters.caption) & ~filters.command(["update", "restart", "start"]))
 async def handle_link(client, message):
-    url = extract_url(message.text)
+    url = extract_url(message)
     if not url:
+        print(f"[LINK] No URL found in message: '{message.text or message.caption}'")
         return
 
+    print(f"[LINK] Processing URL: {url[:70]}...")
     is_pdf = is_pdf_url(url)
     task_id = f"{message.chat.id}_{message.id}_{int(time.time())}"
     filename = f"file_{message.id}_{int(time.time())}" + (".pdf" if is_pdf else ".mp4")
@@ -445,7 +466,6 @@ async def handle_link(client, message):
                 progress=_upload_progress, progress_args=(task_id,)
             )
         else:
-            # Prepare faststart MP4, thumbnail, and video metadata for streaming playback
             fast_video, duration, width, height, thumb_file = await asyncio.to_thread(
                 _prepare_video_metadata_and_faststart, output_path
             )
