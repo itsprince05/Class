@@ -375,8 +375,20 @@ def _decrypt_classx_url(encrypted_str, iv_string=None):
 
     return ""
 
+def _format_classx_player_url(val):
+    """If val is a raw ClassX token string (e.g. m7hcRsBTJp5eNY5aTdn8qpPBOzdeUe), format it into a secure player URL."""
+    if not val or not isinstance(val, str):
+        return ""
+    val = val.strip()
+    if val.startswith("http"):
+        return val
+    # If 15-120 characters long token string without spaces/json
+    if 15 <= len(val) <= 120 and not any(c in val for c in [" ", "\n", "\t", "{", "}", "[", "]"]):
+        return f"https://player.appx.co.in/secure-player?isMobile=true&token={val}"
+    return ""
+
 def _find_url_in_dict(obj):
-    """Recursively search for a video URL or decryptable string in any dict or list."""
+    """Recursively search for a video URL, decryptable string, or token in any dict or list."""
     if isinstance(obj, dict):
         iv_str = obj.get("iv_string") or obj.get("iv") or ""
 
@@ -390,12 +402,17 @@ def _find_url_in_dict(obj):
                         for k in ["path", "file_link", "download_link", "url", "link", "encrypted_link"]:
                             val = sub_item.get(k)
                             if val:
-                                dec = _decrypt_classx_url(str(val), iv_str)
+                                val_str = str(val).strip()
+                                dec = _decrypt_classx_url(val_str, iv_str)
                                 if dec and dec.startswith("http"):
                                     print(f"[RESOLVE] Decrypted direct stream link from {lf}[{k}]: {dec[:60]}...")
                                     return dec
+                                player_url = _format_classx_player_url(val_str)
+                                if player_url:
+                                    print(f"[RESOLVE] Formatted player URL from {lf}[{k}]: {player_url[:60]}...")
+                                    return player_url
 
-        # 2. Check encrypted single fields
+        # 2. Check encrypted/token single fields
         enc_keys = [
             "encrypted_link", "file_link", "download_link", "encrypted_link_720",
             "encrypted_link_480", "encrypted_link_360", "encrypted_link_1080", "encrypted_url"
@@ -403,11 +420,18 @@ def _find_url_in_dict(obj):
         for key in enc_keys:
             if key in obj and obj[key]:
                 val = str(obj[key]).strip()
-                if val and not val.startswith("http"):
+                if val:
+                    if val.startswith("http"):
+                        if not val.lower().endswith("token="):
+                            return val
                     dec = _decrypt_classx_url(val, iv_str)
                     if dec and dec.startswith("http"):
                         print(f"[RESOLVE] Decrypted direct stream link from '{key}': {dec[:60]}...")
                         return dec
+                    player_url = _format_classx_player_url(val)
+                    if player_url:
+                        print(f"[RESOLVE] Formatted player URL from '{key}': {player_url[:60]}...")
+                        return player_url
 
         # 3. Direct stream URL fields (.m3u8 / .mp4 / akamai / stream)
         stream_keys = [
@@ -426,6 +450,9 @@ def _find_url_in_dict(obj):
                     dec = _decrypt_classx_url(val, iv_str)
                     if dec and dec.startswith("http"):
                         return dec
+                    player_url = _format_classx_player_url(val)
+                    if player_url:
+                        return player_url
 
         # 4. Fallback fields (download_link, url, link)
         for key in ["download_link", "url", "link"]:
@@ -439,6 +466,10 @@ def _find_url_in_dict(obj):
                         return dec
                     if not val.lower().endswith("token="):
                         return val
+                else:
+                    player_url = _format_classx_player_url(val)
+                    if player_url:
+                        return player_url
 
         # 5. Recursive search in sub-dictionaries / lists
         for k, v in obj.items():
