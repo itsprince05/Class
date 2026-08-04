@@ -343,32 +343,56 @@ def _parse_links_field(field_val):
     return []
 
 def _decrypt_classx_url(encrypted_str, iv_string=None):
-    """Decrypt ClassX encrypted video link if encrypted."""
+    """Decrypt ClassX encrypted video/pdf link (handles cipher_b64:iv_b64 payload format)."""
     if not encrypted_str or not isinstance(encrypted_str, str):
         return ""
+
     encrypted_str = encrypted_str.strip()
     if encrypted_str.startswith("http"):
         return encrypted_str
 
     key = b"6385731993184651"
-    iv = key
+
+    # Format 1: cipher_b64:iv_b64 payload (ClassX standard format)
+    if ":" in encrypted_str:
+        parts = encrypted_str.split(":", 1)
+        cipher_b64 = parts[0].strip()
+        iv_b64 = parts[1].strip()
+        try:
+            iv = base64.b64decode(iv_b64)
+            if len(iv) >= 16:
+                iv = iv[:16]
+            cipher = AES.new(key, AES.MODE_CBC, iv)
+            decrypted = cipher.decrypt(base64.b64decode(cipher_b64))
+            decrypted_str = unpad(decrypted, AES.block_size).decode("utf-8", errors="ignore").strip()
+            if decrypted_str.startswith("http"):
+                print(f"[DECRYPT] Decrypted payload URL: {decrypted_str[:70]}...")
+                return decrypted_str
+        except Exception as e:
+            print(f"[DECRYPT] Payload decode error: {e}")
+
+    # Format 2: standalone cipher_b64 with optional iv_string or default key/IV
+    cipher_b64 = encrypted_str.split(":")[0].strip() if ":" in encrypted_str else encrypted_str
+
+    iv_candidates = []
     if iv_string:
         try:
             raw_iv = base64.b64decode(iv_string)
             if len(raw_iv) >= 16:
-                iv = raw_iv[:16]
-            elif len(iv_string.encode('utf-8')) >= 16:
-                iv = iv_string.encode('utf-8')[:16]
+                iv_candidates.append(raw_iv[:16])
         except Exception:
-            if len(iv_string.encode('utf-8')) >= 16:
-                iv = iv_string.encode('utf-8')[:16]
+            pass
+        if len(iv_string.encode("utf-8")) >= 16:
+            iv_candidates.append(iv_string.encode("utf-8")[:16])
+    iv_candidates.append(key)
 
-    for try_iv in [iv, key]:
+    for try_iv in iv_candidates:
         try:
             cipher = AES.new(key, AES.MODE_CBC, try_iv)
-            decrypted = cipher.decrypt(base64.b64decode(encrypted_str))
+            decrypted = cipher.decrypt(base64.b64decode(cipher_b64))
             decrypted_str = unpad(decrypted, AES.block_size).decode("utf-8", errors="ignore").strip()
             if decrypted_str.startswith("http"):
+                print(f"[DECRYPT] Decrypted fallback URL: {decrypted_str[:70]}...")
                 return decrypted_str
         except Exception:
             pass
@@ -400,17 +424,15 @@ def _find_url_in_dict(obj):
         for key in classx_player_keys:
             if key in obj and obj[key]:
                 val = str(obj[key]).strip()
-                if val:
-                    if val.startswith("http"):
-                        # If URL ends with token=, try to append token if available
-                        if "token=" in val.lower() and (val.lower().endswith("token=") or val.lower().endswith("token")):
-                            tok = obj.get("file_link") or obj.get("download_link") or obj.get("video_player_token") or ""
-                            if tok and tok != "1234":
-                                val = val.rstrip("=") + "=" + str(tok).strip()
-                            else:
-                                continue
-                        print(f"[RESOLVE] Found ClassX player URL from '{key}': {val[:60]}...")
-                        return val
+                if val and val.startswith("http"):
+                    # If URL ends with token=, try to append token if available
+                    if "token=" in val.lower() and val.lower().endswith("token="):
+                        tok = obj.get("file_link") or obj.get("download_link") or obj.get("video_player_token") or ""
+                        if tok and tok != "1234":
+                            val = val + str(tok).strip()
+                    print(f"[RESOLVE] Found ClassX player URL from '{key}': {val[:60]}...")
+                    return val
+                elif val:
                     dec = _decrypt_classx_url(val, iv_str)
                     if dec and dec.startswith("http"):
                         return dec
@@ -712,7 +734,7 @@ def _resolve_video_url(item_data, course_id):
     return "", f"No link in API data. KVs: {kv_sample}"
 
 def _resolve_pdf_urls(item_data):
-    """Extract PDF URLs from item data."""
+    """Extract PDF URLs from item data (decrypted if encrypted)."""
     pdfs = []
     
     # ClassX can have multiple PDFs (study_material_link, pdf_link, pdf_link2, pdf_link3, etc.)
@@ -722,8 +744,13 @@ def _resolve_pdf_urls(item_data):
         link = item_data.get(field, "")
         if not link:
             continue
+        link = str(link).strip()
         if link.startswith("http"):
             pdfs.append(link)
+        else:
+            dec = _decrypt_classx_url(link)
+            if dec and dec.startswith("http"):
+                pdfs.append(dec)
     return pdfs
 
 # ---------------------------------------------------------------------------
