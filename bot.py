@@ -335,6 +335,8 @@ async def download_video(url: str, output_path: str, task_id: str, quality: str 
             sys.executable, "-m", "yt_dlp",
             "--no-check-certificates",
             "--no-warnings",
+            "--user-agent", HEADERS["User-Agent"],
+            "--referer", HEADERS["Referer"],
             "--concurrent-fragments", "8",
             "-f", format_spec,
             "--merge-output-format", "mp4",
@@ -343,7 +345,8 @@ async def download_video(url: str, output_path: str, task_id: str, quality: str 
         ]
         
         for k, v in HEADERS.items():
-            cmd.extend(["--add-header", f"{k}:{v}"])
+            if k not in ["User-Agent", "Referer"]:
+                cmd.extend(["--add-header", f"{k}:{v}"])
             
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -775,6 +778,7 @@ async def process_single_item(client: Client, chat_id: int, item: Dict[str, Any]
     output_path = str(DOWNLOAD_DIR / f"{task_id}{ext}")
     
     status_msg = await client.send_message(chat_id, f"⌛ **Starting download for:** `{name}`")
+    progress_data[task_id] = {"phase": "Initializing...", "current": 0, "total": 0}
     updater = asyncio.create_task(_progress_loop(status_msg, task_id, title=name))
     
     try:
@@ -883,11 +887,7 @@ async def run_batch_download(client: Client, message: Message, state: Dict[str, 
 async def check_restart_notification(client: Client, message: Message):
     if RESTART_FILE.exists():
         try:
-            data = json.loads(RESTART_FILE.read_text())
             RESTART_FILE.unlink()
-            chat_id = data.get("chat_id")
-            if chat_id:
-                await client.send_message(chat_id, "✅ **Bot updated and restarted successfully!**")
         except Exception as e:
             print(f"[RESTART] Notification error: {e}")
     message.continue_propagation()
