@@ -596,14 +596,12 @@ def _extract_stream_from_secure_player(url):
     except Exception as e:
         print(f"[PLAYER] Query param parse error: {e}")
 
-    # 2. Fetch HTML body of player page with proper browser headers
+    # 2. Fetch HTML body of player page with full ClassX API headers
     try:
         all_h = _get_all_headers()
         req = Request(url)
         for k, v in all_h.items():
             req.add_header(k, v)
-        req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36")
-        req.add_header("Referer", "https://yodhaappapi.classx.co.in/")
 
         with urlopen(req, timeout=15) as resp:
             raw_html = resp.read()
@@ -639,6 +637,28 @@ def _extract_stream_from_secure_player(url):
 
     except Exception as e:
         print(f"[PLAYER] Error fetching player page HTML: {e}")
+
+    # 3. Direct candidate HLS stream URL fallback
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        tok_vals = qs.get("token") or qs.get("file_link") or qs.get("download_link") or []
+        if tok_vals:
+            t_val = tok_vals[0]
+            if len(t_val) > 15 and t_val != "1234":
+                hls_candidates = [
+                    f"https://appx-play.classx.co.in/hls/{CLASSX_COURSE_ID}/{t_val}/master.m3u8",
+                    f"https://appx-play.akamai.net.in/hls/{CLASSX_COURSE_ID}/{t_val}/master.m3u8",
+                    f"https://appx-play.classx.co.in/{t_val}/master.m3u8",
+                ]
+                for cand in hls_candidates:
+                    print(f"[PLAYER] Testing fallback HLS URL: {cand}")
+                    ok, status_code, _ = check_url_accessible(cand)
+                    if ok:
+                        print(f"[PLAYER] Accessible fallback HLS stream URL ({status_code}): {cand}")
+                        return cand
+    except Exception as e:
+        print(f"[PLAYER] Fallback construction error: {e}")
 
     return url
 
