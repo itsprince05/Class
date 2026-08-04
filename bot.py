@@ -342,6 +342,13 @@ def _parse_links_field(field_val):
 
     return []
 
+def _clean_b64(s):
+    """Clean backslashes and fix base64 padding."""
+    if not s:
+        return ""
+    s = str(s).replace("\\/", "/").replace("\\", "").strip()
+    return s + "=" * ((4 - len(s) % 4) % 4)
+
 def _decrypt_classx_url(encrypted_str, iv_string=None):
     """Decrypt ClassX encrypted video/pdf link (handles cipher_b64:iv_b64 payload format)."""
     if not encrypted_str or not isinstance(encrypted_str, str):
@@ -356,8 +363,8 @@ def _decrypt_classx_url(encrypted_str, iv_string=None):
     # Format 1: cipher_b64:iv_b64 payload (ClassX standard format)
     if ":" in encrypted_str:
         parts = encrypted_str.split(":", 1)
-        cipher_b64 = parts[0].strip()
-        iv_b64 = parts[1].strip()
+        cipher_b64 = _clean_b64(parts[0])
+        iv_b64 = _clean_b64(parts[1])
         try:
             iv = base64.b64decode(iv_b64)
             if len(iv) >= 16:
@@ -372,12 +379,12 @@ def _decrypt_classx_url(encrypted_str, iv_string=None):
             print(f"[DECRYPT] Payload decode error: {e}")
 
     # Format 2: standalone cipher_b64 with optional iv_string or default key/IV
-    cipher_b64 = encrypted_str.split(":")[0].strip() if ":" in encrypted_str else encrypted_str
+    cipher_b64 = _clean_b64(encrypted_str.split(":")[0] if ":" in encrypted_str else encrypted_str)
 
     iv_candidates = []
     if iv_string:
         try:
-            raw_iv = base64.b64decode(iv_string)
+            raw_iv = base64.b64decode(_clean_b64(iv_string))
             if len(raw_iv) >= 16:
                 iv_candidates.append(raw_iv[:16])
         except Exception:
