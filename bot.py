@@ -457,8 +457,8 @@ async def start_cmd(client: Client, message: Message):
         f"• PDF Documents (Direct PDF, Google Drive PDF, ClassX encrypted PDF)\n"
         f"• Video Streams (YouTube, m3u8, MP4, ClassX/Appx DRM, Drive Video)\n\n"
         f"Usage Guide:\n"
-        f"1. Upload a .txt file containing Name : URL or URL links.\n"
-        f"2. Or send a direct PDF or Video URL in chat."
+        f"1. Send a direct PDF or Video URL in chat.\n"
+        f"2. Optional format: Topic Name : URL"
     )
     buttons = InlineKeyboardMarkup([
         [
@@ -472,7 +472,7 @@ async def start_cmd(client: Client, message: Message):
     ])
     await message.reply_text(welcome_text, reply_markup=buttons)
 
-@app.on_message(filters.command(["update", "upate"]))
+@app.on_message(filters.command("update"))
 async def update_cmd(client: Client, message: Message):
     """Update command handler to pull code, upgrade yt-dlp, and restart."""
     _cleanup_stale_user_states()
@@ -504,7 +504,7 @@ async def update_cmd(client: Client, message: Message):
     # Restart python script
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
-@app.on_message(filters.command(["stop", "cancel"]))
+@app.on_message(filters.command("stop"))
 async def cancel_cmd(client: Client, message: Message):
     """Cancel ongoing download tasks."""
     _cleanup_stale_user_states()
@@ -542,13 +542,11 @@ async def callback_handler(client: Client, query: CallbackQuery):
     if data == "help_menu":
         text = (
             "Help & Instructions\n\n"
-            "• Batch Downloading: Send a .txt file formatted with links:\n"
-            "  Topic Name : https://example.com/video.m3u8\n"
-            "  Document Title : https://example.com/file.pdf\n\n"
-            "• Single Download: Send any direct PDF or Video link in chat.\n"
+            "• Direct Download: Send any direct PDF or Video link in chat.\n"
+            "• Format: Send URL or Topic Name : URL\n"
             "• Supported Types: PDF documents & Video streams.\n"
             "• Edit Caption: Reply to any uploaded Video or PDF with any text to edit its caption.\n"
-            "• Cancel: Click Stop on progress card or send /stop."
+            "• Stop Task: Click Stop on progress card or send /stop."
         )
         buttons = InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="start_menu")]])
         await query.message.edit_text(text, reply_markup=buttons)
@@ -557,8 +555,8 @@ async def callback_handler(client: Client, query: CallbackQuery):
         text = (
             "Available Commands:\n\n"
             "• /start - Launch interactive bot menu\n"
-            "• /update (or /upate) - Pull updates & restart bot\n"
-            "• /stop (or /cancel) - Cancel current active task"
+            "• /update - Pull updates & restart bot\n"
+            "• /stop - Cancel current active task"
         )
         buttons = InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="start_menu")]])
         await query.message.edit_text(text, reply_markup=buttons)
@@ -571,7 +569,7 @@ async def callback_handler(client: Client, query: CallbackQuery):
             f"Supported Links:\n"
             f"• PDF Documents\n"
             f"• Video Streams\n\n"
-            f"Send a .txt file or link to get started!"
+            f"Send a direct PDF or Video link to get started!"
         )
         buttons = InlineKeyboardMarkup([
             [
@@ -623,7 +621,7 @@ async def callback_handler(client: Client, query: CallbackQuery):
 async def document_handler(client: Client, message: Message):
     await message.reply_text("Please send a direct PDF or Video URL in chat.")
 
-@app.on_message(filters.text & ~filters.command(["start", "update", "upate", "stop", "cancel"]))
+@app.on_message(filters.text & ~filters.command(["start", "update", "stop"]))
 async def text_handler(client: Client, message: Message):
     text = message.text.strip()
     
