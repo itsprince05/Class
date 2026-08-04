@@ -312,42 +312,104 @@ def _get_video_details(course_id, video_id):
            f"?course_id={course_id}&folder_wise_course=1&ytflag=0&video_id={video_id}")
     return _api_get(url)
 
-def _decrypt_classx_url(encrypted_str):
+def _parse_links_field(field_val):
+    """Parse encrypted_links or download_links whether it's a list or a stringified list/json."""
+    if not field_val:
+        return []
+    if isinstance(field_val, list):
+        return field_val
+    if isinstance(field_val, str):
+        field_val = field_val.strip()
+        try:
+            parsed = json.loads(field_val)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+        try:
+            import ast
+            parsed = ast.literal_eval(field_val)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+        paths = re.findall(r'[\'"]path[\'"]\s*:\s*[\'"]([^\'"]+)[\'"]', field_val)
+        if paths:
+            return [{"path": p} for p in paths]
+        links = re.findall(r'[\'"](?:file_link|download_link|url|link)[\'"]\s*:\s*[\'"]([^\'"]+)[\'"]', field_val)
+        if links:
+            return [{"path": l} for l in links]
+
+    return []
+
+def _decrypt_classx_url(encrypted_str, iv_string=None):
     """Decrypt ClassX encrypted video link if encrypted."""
-    if not encrypted_str:
+    if not encrypted_str or not isinstance(encrypted_str, str):
         return ""
+    encrypted_str = encrypted_str.strip()
     if encrypted_str.startswith("http"):
         return encrypted_str
-    try:
-        key = b"6385731993184651"
-        iv = b"6385731993184651"
-        cipher = AES.new(key, AES.MODE_CBC, iv)
-        decrypted = cipher.decrypt(base64.b64decode(encrypted_str))
-        decrypted = unpad(decrypted, AES.block_size).decode("utf-8")
-        if decrypted.startswith("http"):
-            return decrypted
-    except Exception:
-        pass
+
+    key = b"6385731993184651"
+    iv = key
+    if iv_string:
+        try:
+            raw_iv = base64.b64decode(iv_string)
+            if len(raw_iv) >= 16:
+                iv = raw_iv[:16]
+            elif len(iv_string.encode('utf-8')) >= 16:
+                iv = iv_string.encode('utf-8')[:16]
+        except Exception:
+            if len(iv_string.encode('utf-8')) >= 16:
+                iv = iv_string.encode('utf-8')[:16]
+
+    for try_iv in [iv, key]:
+        try:
+            cipher = AES.new(key, AES.MODE_CBC, try_iv)
+            decrypted = cipher.decrypt(base64.b64decode(encrypted_str))
+            decrypted_str = unpad(decrypted, AES.block_size).decode("utf-8", errors="ignore").strip()
+            if decrypted_str.startswith("http"):
+                return decrypted_str
+        except Exception:
+            pass
+
     return ""
 
 def _find_url_in_dict(obj):
     """Recursively search for a video URL or decryptable string in any dict or list."""
     if isinstance(obj, dict):
-        # 1. PRIORITY 1: Check encrypted fields FIRST (ClassX stores real AES m3u8 stream links here)
+        iv_str = obj.get("iv_string") or obj.get("iv") or ""
+
+        # 1. Check array fields: encrypted_links, download_links, livestream_links
+        list_fields = ["encrypted_links", "download_links", "livestream_links", "links", "qualities"]
+        for lf in list_fields:
+            if lf in obj and obj[lf]:
+                items_list = _parse_links_field(obj[lf])
+                for sub_item in items_list:
+                    if isinstance(sub_item, dict):
+                        for k in ["path", "file_link", "download_link", "url", "link", "encrypted_link"]:
+                            val = sub_item.get(k)
+                            if val:
+                                dec = _decrypt_classx_url(str(val), iv_str)
+                                if dec and dec.startswith("http"):
+                                    print(f"[RESOLVE] Decrypted direct stream link from {lf}[{k}]: {dec[:60]}...")
+                                    return dec
+
+        # 2. Check encrypted single fields
         enc_keys = [
-            "encrypted_link", "encrypted_link_720", "encrypted_link_480", "encrypted_link_360",
-            "encrypted_link_1080", "encrypted_url", "enc_url"
+            "encrypted_link", "file_link", "download_link", "encrypted_link_720",
+            "encrypted_link_480", "encrypted_link_360", "encrypted_link_1080", "encrypted_url"
         ]
         for key in enc_keys:
             if key in obj and obj[key]:
                 val = str(obj[key]).strip()
-                if val:
-                    dec = _decrypt_classx_url(val)
+                if val and not val.startswith("http"):
+                    dec = _decrypt_classx_url(val, iv_str)
                     if dec and dec.startswith("http"):
                         print(f"[RESOLVE] Decrypted direct stream link from '{key}': {dec[:60]}...")
                         return dec
 
-        # 2. PRIORITY 2: Direct stream URL fields (.m3u8 / .mp4 / akamai / stream)
+        # 3. Direct stream URL fields (.m3u8 / .mp4 / akamai / stream)
         stream_keys = [
             "hls_url", "m3u8_url", "stream_url", "video_url", "video_link",
             "video_url_720", "video_url_480", "video_url_360", "video_url_1080",
@@ -356,30 +418,29 @@ def _find_url_in_dict(obj):
         for key in stream_keys:
             if key in obj and obj[key]:
                 val = str(obj[key]).strip()
-                # Skip template player links with empty token
                 if "secure-player" in val.lower() and val.lower().endswith("token="):
                     continue
                 if val.startswith("http"):
                     if any(ext in val.lower() for ext in [".m3u8", ".mp4", "akamai", "cdn", "hls"]):
                         return val
-                    dec = _decrypt_classx_url(val)
+                    dec = _decrypt_classx_url(val, iv_str)
                     if dec and dec.startswith("http"):
                         return dec
 
-        # 3. PRIORITY 3: Fallback fields (download_link, url, link)
+        # 4. Fallback fields (download_link, url, link)
         for key in ["download_link", "url", "link"]:
             if key in obj and obj[key]:
                 val = str(obj[key]).strip()
                 if "secure-player" in val.lower() and val.lower().endswith("token="):
                     continue
                 if val.startswith("http"):
-                    dec = _decrypt_classx_url(val)
+                    dec = _decrypt_classx_url(val, iv_str)
                     if dec and dec.startswith("http"):
                         return dec
                     if not val.lower().endswith("token="):
                         return val
 
-        # 4. PRIORITY 4: Recursive search in sub-dictionaries / lists
+        # 5. Recursive search in sub-dictionaries / lists
         for k, v in obj.items():
             if k in ["lecture_summary_url", "image", "thumbnail", "photo", "icon", "banner"]:
                 continue
