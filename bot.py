@@ -1379,9 +1379,7 @@ async def handle_test(client, message):
     await status.edit_text(text)
 
 
-# ---------------------------------------------------------------------------
-# /update command
-# ---------------------------------------------------------------------------
+RESTART_FILE = BASE_DIR / "restart_info.json"
 
 
 @app.on_message(owner_filter & filters.command("update"))
@@ -1398,6 +1396,36 @@ async def handle_update(client, message):
     output = (result.stdout.strip() or result.stderr.strip() or "No output")
     await status.edit_text(f"Update result:\n\n{output}\n\nRestarting...")
 
+    try:
+        restart_info = {
+            "chat_id": message.chat.id,
+            "reply_to": status.id,
+            "action": "update",
+            "output": output,
+        }
+        RESTART_FILE.write_text(json.dumps(restart_info, indent=2))
+    except Exception as e:
+        print(f"[UPDATE] Error saving restart info: {e}")
+
+    await asyncio.sleep(1)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+@app.on_message(owner_filter & filters.command("restart"))
+async def handle_restart(client, message):
+    status = await message.reply_text("Restarting bot process...")
+
+    try:
+        restart_info = {
+            "chat_id": message.chat.id,
+            "reply_to": status.id,
+            "action": "restart",
+            "output": "Manual restart",
+        }
+        RESTART_FILE.write_text(json.dumps(restart_info, indent=2))
+    except Exception as e:
+        print(f"[RESTART] Error saving restart info: {e}")
+
     await asyncio.sleep(1)
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -1407,7 +1435,7 @@ async def handle_update(client, message):
 # ---------------------------------------------------------------------------
 
 
-@app.on_message(owner_filter & filters.text & ~filters.command(["update", "start", "test", "setheaders", "headers", "clearheaders", "setapi", "api", "clearapi", "batch", "help"]))
+@app.on_message(owner_filter & filters.text & ~filters.command(["update", "restart", "start", "test", "setheaders", "headers", "clearheaders", "setapi", "api", "clearapi", "batch", "help"]))
 async def handle_link(client, message):
     url = extract_url(message.text)
     if url is None:
@@ -1530,11 +1558,33 @@ async def handle_link(client, message):
 # Entry point
 # ---------------------------------------------------------------------------
 
+async def main():
+    async with app:
+        print("Bot started. Listening in owner group only.")
+
+        # Check for pending restart notification
+        if RESTART_FILE.exists():
+            try:
+                data = json.loads(RESTART_FILE.read_text())
+                if RESTART_FILE.exists():
+                    RESTART_FILE.unlink()
+
+                chat_id = data.get("chat_id")
+                out = data.get("output", "")
+
+                msg = f"Restarted successfully!\n\nGit result:\n{out[:400]}"
+                if chat_id:
+                    await app.send_message(chat_id=chat_id, text=msg)
+            except Exception as e:
+                print(f"[STARTUP] Restart notification error: {e}")
+
+        await asyncio.Event().wait()
+
+
 if __name__ == "__main__":
     # Quick sanity check
     if not BOT_TOKEN or not API_ID or not API_HASH:
         print("ERROR: BOT_TOKEN, API_ID, or API_HASH missing from .env")
         sys.exit(1)
 
-    print("Bot started. Listening in owner group only.")
-    app.run()
+    asyncio.run(main())
