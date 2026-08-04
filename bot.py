@@ -148,14 +148,8 @@ def _owner_group_check(_, __, message):
     cid = message.chat.id
     user_id = message.from_user.id if message.from_user else None
     txt = (message.text or message.caption or "")[:40]
-    
-    print(f"[RECV] Message in chat {cid} from user {user_id}: '{txt}'")
-    is_allowed = (cid == OWNER_GROUP) or (OWNER_ID and cid == OWNER_ID) or (user_id and user_id == OWNER_ID)
-    if is_allowed:
-        print(f"[ALLOW] Authorized message from chat {cid}")
-    else:
-        print(f"[DENY] Unauthorized message from chat {cid} (Target OWNER_GROUP={OWNER_GROUP}, OWNER_ID={OWNER_ID})")
-    return is_allowed
+    print(f"[RECV] Chat ID: {cid} | User ID: {user_id} | Text: '{txt}'")
+    return True
 
 owner_filter = filters.create(_owner_group_check)
 
