@@ -425,11 +425,13 @@ def _find_url_in_dict(obj):
             if key in obj and obj[key]:
                 val = str(obj[key]).strip()
                 if val and val.startswith("http"):
-                    # If URL ends with token=, try to append token if available
+                    # If URL ends with token=, try to append valid token if available; otherwise skip incomplete template URL
                     if "token=" in val.lower() and val.lower().endswith("token="):
                         tok = obj.get("file_link") or obj.get("download_link") or obj.get("video_player_token") or ""
                         if tok and tok != "1234":
                             val = val + str(tok).strip()
+                        else:
+                            continue
                     print(f"[RESOLVE] Found ClassX player URL from '{key}': {val[:60]}...")
                     return val
                 elif val:
