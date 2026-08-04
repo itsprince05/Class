@@ -392,6 +392,29 @@ def _find_url_in_dict(obj):
     if isinstance(obj, dict):
         iv_str = obj.get("iv_string") or obj.get("iv") or ""
 
+        # 0. PRIORITY 0: Check explicit ClassX URL keys (video_player_url, download_url_higher_version, etc.)
+        classx_player_keys = [
+            "video_player_url", "download_url_higher_version", "download_url_lower_version",
+            "video_player_lower_url"
+        ]
+        for key in classx_player_keys:
+            if key in obj and obj[key]:
+                val = str(obj[key]).strip()
+                if val:
+                    if val.startswith("http"):
+                        # If URL ends with token=, try to append token if available
+                        if "token=" in val.lower() and (val.lower().endswith("token=") or val.lower().endswith("token")):
+                            tok = obj.get("file_link") or obj.get("download_link") or obj.get("video_player_token") or ""
+                            if tok and tok != "1234":
+                                val = val.rstrip("=") + "=" + str(tok).strip()
+                            else:
+                                continue
+                        print(f"[RESOLVE] Found ClassX player URL from '{key}': {val[:60]}...")
+                        return val
+                    dec = _decrypt_classx_url(val, iv_str)
+                    if dec and dec.startswith("http"):
+                        return dec
+
         # 1. Check array fields: encrypted_links, download_links, livestream_links
         list_fields = ["encrypted_links", "download_links", "livestream_links", "links", "qualities"]
         for lf in list_fields:
