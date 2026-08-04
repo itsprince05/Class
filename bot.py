@@ -193,7 +193,10 @@ async def _progress_loop(status_msg: Message, task_id: str, title: str = "", is_
         elapsed = now - start_time
         
         media_type = "PDF" if is_pdf else "Video"
-        header = f"{phase} {media_type}..."
+        if " " in phase:
+            header = f"{phase}..." if not phase.endswith("...") else phase
+        else:
+            header = f"{phase} {media_type}..."
         
         if total > 0:
             speed = current / elapsed if elapsed > 0 else 0
@@ -217,7 +220,7 @@ async def _progress_loop(status_msg: Message, task_id: str, title: str = "", is_
                 await status_msg.edit_text(
                     text,
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⛔ Stop", callback_data=f"cancel_{task_id}")]
+                        [InlineKeyboardButton("Stop", callback_data=f"cancel_{task_id}")]
                     ])
                 )
                 last_update = now
@@ -235,7 +238,7 @@ async def download_pdf(url: str, output_path: str, task_id: str) -> Tuple[bool, 
         req = Request(url, headers=HEADERS)
         with urlopen(req, timeout=60) as resp:
             total_size = int(resp.headers.get("Content-Length", 0))
-            progress_data[task_id] = {"phase": "Downloading PDF...", "current": 0, "total": total_size}
+            progress_data[task_id] = {"phase": "Downloading", "current": 0, "total": total_size}
             
             downloaded = 0
             with open(output_path, "wb") as f:
@@ -284,7 +287,7 @@ async def download_video(url: str, output_path: str, task_id: str, quality: str 
             limit=10 * 1024 * 1024
         )
         active_processes[task_id] = process
-        progress_data[task_id] = {"phase": "Downloading Video...", "current": 0, "total": 0}
+        progress_data[task_id] = {"phase": "Downloading", "current": 0, "total": 0}
         
         output_logs = []
 
