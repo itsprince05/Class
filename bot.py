@@ -86,13 +86,7 @@ async def fast_save_file(self: Client, *args, **kwargs) -> Union[InputFile, Inpu
     if path is None and len(args) > 0:
         path = args[0]
         
-    # Fallback to original save_file for small files or if path is missing
-    if not path or not isinstance(path, (str, Path)) or not os.path.exists(path):
-        return await original_save_file(self, *args, **kwargs)
-        
     file_size = os.path.getsize(path)
-    if file_size < 10 * 1024 * 1024:
-        return await original_save_file(self, *args, **kwargs)
         
     # Extract other arguments if passed
     file_id = kwargs.get("file_id")
@@ -1063,12 +1057,6 @@ async def _download_video(url, output_path, task_id):
             "--http-chunk-size", "32M",
         ]
 
-        if shutil.which("aria2c"):
-            ytdlp_cmd += [
-                "--downloader", "aria2c",
-                "--downloader-args", "aria2c:-j 32 -s 32 -x 32 -k 1M --summary-interval=0"
-            ]
-
         for hk, hv in all_headers.items():
             ytdlp_cmd += ["--add-header", f"{hk}: {hv}"]
         ytdlp_cmd += ["-o", output_path, url]
@@ -1086,13 +1074,13 @@ async def _download_video(url, output_path, task_id):
         if task_id in cancelled_tasks:
             return False, "Cancelled by user"
 
-        if process.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        if process.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1 * 1024 * 1024:
             monitor.cancel()
-            print(f"[DOWNLOAD] yt-dlp succeeded")
+            print(f"[DOWNLOAD] yt-dlp succeeded ({os.path.getsize(output_path)} bytes)")
             return True, ""
 
         ytdlp_err = stderr_bytes.decode(errors="replace").strip()
-        print(f"[DOWNLOAD] yt-dlp failed: {ytdlp_err[-200:]}")
+        print(f"[DOWNLOAD] yt-dlp failed (size={os.path.getsize(output_path) if os.path.exists(output_path) else 0}): {ytdlp_err[-200:]}")
 
     except FileNotFoundError as fnf:
         print(f"[DOWNLOAD] yt-dlp binary not found: {fnf}")
@@ -1149,8 +1137,8 @@ async def _download_video(url, output_path, task_id):
     except asyncio.CancelledError:
         pass
 
-    if process.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-        print(f"[DOWNLOAD] ffmpeg succeeded")
+    if process.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1 * 1024 * 1024:
+        print(f"[DOWNLOAD] ffmpeg succeeded ({os.path.getsize(output_path)} bytes)")
         return True, ""
 
     ffmpeg_err = stderr_bytes.decode(errors="replace").strip()
