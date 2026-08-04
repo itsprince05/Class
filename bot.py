@@ -630,10 +630,12 @@ async def _download_video(url, output_path, task_id):
     monitor = asyncio.create_task(_monitor())
 
     # --- Try yt-dlp first ---
-    ytdlp_err = "yt-dlp not installed"
+    ytdlp_err = "yt-dlp execution failed"
     try:
-        ytdlp_cmd = [
-            "yt-dlp",
+        yt_bin = shutil.which("yt-dlp")
+        ytdlp_base = [yt_bin] if yt_bin else [sys.executable, "-m", "yt_dlp"]
+
+        ytdlp_cmd = ytdlp_base + [
             "--no-warnings",
             "--no-check-certificates",
             "-N", "16",
@@ -656,7 +658,7 @@ async def _download_video(url, output_path, task_id):
             ytdlp_cmd += ["--add-header", f"{hk}: {hv}"]
         ytdlp_cmd += ["-o", output_path, url]
 
-        print(f"[DOWNLOAD] Trying yt-dlp...")
+        print(f"[DOWNLOAD] Trying yt-dlp via {' '.join(ytdlp_base)}...")
         process = await asyncio.create_subprocess_exec(
             *ytdlp_cmd,
             stdout=asyncio.subprocess.DEVNULL,
@@ -677,8 +679,12 @@ async def _download_video(url, output_path, task_id):
         ytdlp_err = stderr_bytes.decode(errors="replace").strip()
         print(f"[DOWNLOAD] yt-dlp failed: {ytdlp_err[-200:]}")
 
-    except FileNotFoundError:
-        print(f"[DOWNLOAD] yt-dlp not installed, skipping")
+    except FileNotFoundError as fnf:
+        print(f"[DOWNLOAD] yt-dlp binary not found: {fnf}")
+        ytdlp_err = f"yt-dlp binary not found ({fnf})"
+    except Exception as exc:
+        print(f"[DOWNLOAD] yt-dlp exception: {exc}")
+        ytdlp_err = str(exc)
 
     # --- Fallback to ffmpeg ---
     print(f"[DOWNLOAD] Falling back to ffmpeg...")
@@ -690,14 +696,16 @@ async def _download_video(url, output_path, task_id):
         except OSError:
             pass
 
+    user_agent_val = all_headers.get("User-Agent") or HEADERS["User-Agent"]
     ffmpeg_cmd = [
         "ffmpeg",
         "-y",
+        "-user_agent", user_agent_val,
+        "-headers", ffmpeg_headers,
         "-reconnect", "1",
         "-reconnect_at_eof", "1",
         "-reconnect_streamed", "1",
         "-reconnect_delay_max", "5",
-        "-headers", ffmpeg_headers,
         "-i", url,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
