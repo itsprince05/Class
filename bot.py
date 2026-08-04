@@ -592,100 +592,111 @@ def _decode_jwt_or_base64(token_str):
         except Exception:
             pass
 
-    return ""
+def _resolve_master_m3u8(url):
+    """If url is an HLS master playlist with query tokens, resolve the child playlist URL with query parameters appended."""
+    if not url or not isinstance(url, str) or ".m3u8" not in url.lower():
+        return url
+
+    try:
+        parsed = urlparse(url)
+        query = parsed.query
+        if not query:
+            return url
+
+        # Fetch master m3u8 content
+        req = Request(url)
+        all_h = _get_all_headers()
+        for k, v in all_h.items():
+            req.add_header(k, v)
+
+        with urlopen(req, timeout=10) as resp:
+            raw_data = resp.read()
+            if resp.headers.get("Content-Encoding") == "gzip":
+                raw_data = gzip.decompress(raw_data)
+            m3u8_text = raw_data.decode("utf-8", errors="replace")
+
+        # Find child m3u8 playlist links in master.m3u8
+        lines = [line.strip() for line in m3u8_text.splitlines() if line.strip() and not line.startswith("#")]
+        if lines:
+            child_path = lines[-1]  # Pick highest quality / last playlist line
+            child_url = urljoin(url, child_path)
+            if "?" not in child_url and query:
+                child_url = f"{child_url}?{query}"
+            print(f"[RESOLVE] Resolved master m3u8 -> child playlist URL: {child_url[:80]}...")
+            return child_url
+    except Exception as e:
+        print(f"[RESOLVE] _resolve_master_m3u8 error: {e}")
+
+    return url
+
 
 def _extract_stream_from_secure_player(url):
     """If url is an Appx secure-player link, resolve the actual .m3u8 or .mp4 stream URL."""
     if not url or not isinstance(url, str):
         return url
 
-    if "secure-player" not in url.lower() and "player.appx" not in url.lower():
-        return url
+    resolved = url
+    if "secure-player" in url.lower() or "player.appx" in url.lower():
+        print(f"[PLAYER] Resolving Appx player URL: {url}")
+        
+        # 1. Check ALL query params in URL
+        try:
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query)
+            for param_key, val_list in qs.items():
+                for raw_val in val_list:
+                    val = unquote(raw_val)
+                    if val.startswith("http") and ("m3u8" in val or "mp4" in val or "akamai" in val or "hls" in val):
+                        print(f"[PLAYER] Found direct URL in param '{param_key}': {val}")
+                        resolved = val
+                        break
+                    decoded = _decode_jwt_or_base64(val)
+                    if decoded:
+                        print(f"[PLAYER] Decoded URL from param '{param_key}': {decoded}")
+                        resolved = decoded
+                        break
+                if resolved != url:
+                    break
+        except Exception as e:
+            print(f"[PLAYER] Query param parse error: {e}")
 
-    print(f"[PLAYER] Resolving Appx player URL: {url}")
-    
-    # 1. Check ALL query params in URL
-    try:
-        parsed = urlparse(url)
-        qs = parse_qs(parsed.query)
-        for param_key, val_list in qs.items():
-            for raw_val in val_list:
-                val = unquote(raw_val)
-                if val.startswith("http") and ("m3u8" in val or "mp4" in val or "akamai" in val or "hls" in val):
-                    print(f"[PLAYER] Found direct URL in param '{param_key}': {val}")
-                    return val
-                decoded = _decode_jwt_or_base64(val)
-                if decoded:
-                    print(f"[PLAYER] Decoded URL from param '{param_key}': {decoded}")
-                    return decoded
-    except Exception as e:
-        print(f"[PLAYER] Query param parse error: {e}")
+        if resolved == url:
+            # 2. Fetch HTML body of player page with full ClassX API headers
+            try:
+                all_h = _get_all_headers()
+                req = Request(url)
+                for k, v in all_h.items():
+                    req.add_header(k, v)
 
-    # 2. Fetch HTML body of player page with full ClassX API headers
-    try:
-        all_h = _get_all_headers()
-        req = Request(url)
-        for k, v in all_h.items():
-            req.add_header(k, v)
+                with urlopen(req, timeout=15) as resp:
+                    raw_html = resp.read()
+                    if resp.headers.get("Content-Encoding") == "gzip":
+                        raw_html = gzip.decompress(raw_html)
+                    html = raw_html.decode("utf-8", errors="replace")
 
-        with urlopen(req, timeout=15) as resp:
-            raw_html = resp.read()
-            if resp.headers.get("Content-Encoding") == "gzip":
-                raw_html = gzip.decompress(raw_html)
-            html = raw_html.decode("utf-8", errors="replace")
+                # Search for direct .m3u8 or .mp4 links in HTML
+                m3u8_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html)
+                if m3u8_matches:
+                    print(f"[PLAYER] Found m3u8 URL in HTML: {m3u8_matches[0]}")
+                    resolved = m3u8_matches[0]
+                else:
+                    mp4_matches = re.findall(r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*', html)
+                    if mp4_matches:
+                        print(f"[PLAYER] Found mp4 URL in HTML: {mp4_matches[0]}")
+                        resolved = mp4_matches[0]
+                    else:
+                        source_matches = re.findall(r'(?:file|source|src|url|hls|video)\s*:\s*["\'](https?://[^"\']+)["\']', html, re.IGNORECASE)
+                        for src in source_matches:
+                            if not any(src.lower().endswith(ext) for ext in [".js", ".css", ".png", ".jpg"]):
+                                print(f"[PLAYER] Found source match in JS: {src}")
+                                resolved = src
+                                break
 
-        # Search for direct .m3u8 or .mp4 links in HTML
-        m3u8_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html)
-        if m3u8_matches:
-            print(f"[PLAYER] Found m3u8 URL in HTML: {m3u8_matches[0]}")
-            return m3u8_matches[0]
+            except Exception as e:
+                print(f"[PLAYER] Error fetching player page HTML: {e}")
 
-        mp4_matches = re.findall(r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*', html)
-        if mp4_matches:
-            print(f"[PLAYER] Found mp4 URL in HTML: {mp4_matches[0]}")
-            return mp4_matches[0]
+    return _resolve_master_m3u8(resolved)
 
-        # Search for file: "..." or source: "..." or hls: "..."
-        source_matches = re.findall(r'(?:file|source|src|url|hls|video)\s*:\s*["\'](https?://[^"\']+)["\']', html, re.IGNORECASE)
-        for src in source_matches:
-            if not any(src.lower().endswith(ext) for ext in [".js", ".css", ".png", ".jpg"]):
-                print(f"[PLAYER] Found source match in JS: {src}")
-                return src
-
-        # Check for encrypted / JWT strings in HTML
-        tokens_in_html = re.findall(r'["\'](eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)["\']', html)
-        for tok in tokens_in_html:
-            decoded = _decode_jwt_or_base64(tok)
-            if decoded:
-                print(f"[PLAYER] Decoded stream URL from HTML JWT: {decoded}")
-                return decoded
-
-    except Exception as e:
-        print(f"[PLAYER] Error fetching player page HTML: {e}")
-
-    # 3. Direct candidate HLS stream URL fallback
-    try:
-        parsed = urlparse(url)
-        qs = parse_qs(parsed.query)
-        tok_vals = qs.get("token") or qs.get("file_link") or qs.get("download_link") or []
-        if tok_vals:
-            t_val = tok_vals[0]
-            if len(t_val) > 15 and t_val != "1234":
-                hls_candidates = [
-                    f"https://appx-play.classx.co.in/hls/{CLASSX_COURSE_ID}/{t_val}/master.m3u8",
-                    f"https://appx-play.akamai.net.in/hls/{CLASSX_COURSE_ID}/{t_val}/master.m3u8",
-                    f"https://appx-play.classx.co.in/{t_val}/master.m3u8",
-                ]
-                for cand in hls_candidates:
-                    print(f"[PLAYER] Testing fallback HLS URL: {cand}")
-                    ok, status_code, _ = check_url_accessible(cand)
-                    if ok:
-                        print(f"[PLAYER] Accessible fallback HLS stream URL ({status_code}): {cand}")
-                        return cand
-    except Exception as e:
-        print(f"[PLAYER] Fallback construction error: {e}")
-
-    return url
 
 def _resolve_video_url(item_data, course_id):
     """Extract or fetch video URL for a given item.
@@ -1047,14 +1058,11 @@ async def _download_video(url, output_path, task_id):
             "--no-check-certificates",
             "--user-agent", user_agent_val,
             "--referer", referer_val,
-            "-N", "32",
-            "--concurrent-fragments", "32",
-            "--hls-use-mpegts",
+            "-N", "16",
+            "--concurrent-fragments", "16",
             "--fragment-retries", "10",
             "--retries", "10",
             "--file-access-retries", "10",
-            "--buffer-size", "16M",
-            "--http-chunk-size", "32M",
         ]
 
         for hk, hv in all_headers.items():
@@ -1074,10 +1082,15 @@ async def _download_video(url, output_path, task_id):
         if task_id in cancelled_tasks:
             return False, "Cancelled by user"
 
-        if process.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1 * 1024 * 1024:
-            monitor.cancel()
-            print(f"[DOWNLOAD] yt-dlp succeeded ({os.path.getsize(output_path)} bytes)")
-            return True, ""
+        if process.returncode == 0 and os.path.exists(output_path):
+            file_size = os.path.getsize(output_path)
+            dur, _, _ = _get_video_metadata(output_path)
+            if file_size > 5 * 1024 * 1024 and dur > 30:
+                monitor.cancel()
+                print(f"[DOWNLOAD] yt-dlp succeeded ({file_size} bytes, duration {dur}s)")
+                return True, ""
+            else:
+                print(f"[DOWNLOAD] yt-dlp incomplete output: size={file_size}, duration={dur}s")
 
         ytdlp_err = stderr_bytes.decode(errors="replace").strip()
         print(f"[DOWNLOAD] yt-dlp failed (size={os.path.getsize(output_path) if os.path.exists(output_path) else 0}): {ytdlp_err[-200:]}")
@@ -1137,9 +1150,14 @@ async def _download_video(url, output_path, task_id):
     except asyncio.CancelledError:
         pass
 
-    if process.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1 * 1024 * 1024:
-        print(f"[DOWNLOAD] ffmpeg succeeded ({os.path.getsize(output_path)} bytes)")
-        return True, ""
+    if process.returncode == 0 and os.path.exists(output_path):
+        file_size = os.path.getsize(output_path)
+        dur, _, _ = _get_video_metadata(output_path)
+        if file_size > 5 * 1024 * 1024 and dur > 30:
+            print(f"[DOWNLOAD] ffmpeg succeeded ({file_size} bytes, duration {dur}s)")
+            return True, ""
+        else:
+            print(f"[DOWNLOAD] ffmpeg incomplete output: size={file_size}, duration={dur}s")
 
     ffmpeg_err = stderr_bytes.decode(errors="replace").strip()
     last_lines = "\n".join(ffmpeg_err.split("\n")[-3:])
