@@ -100,12 +100,12 @@ async def fast_save_file(self: Client, *args, **kwargs) -> Union[InputFile, Inpu
     progress = kwargs.get("progress")
     progress_args = kwargs.get("progress_args", ())
     
-    part_size = 512 * 1024
+    part_size = 1024 * 1024  # 1 MB chunk size for high-speed VPS
     total_parts = math.ceil(file_size / part_size)
     if file_id is None:
         file_id = random.getrandbits(63)
         
-    sem = asyncio.Semaphore(10)  # Reduced from 50 to prevent Telegram rate limits
+    sem = asyncio.Semaphore(20)  # 20 concurrent parallel upload connections
     uploaded_bytes = 0
     
     task_id = progress_args[0] if progress_args else None
@@ -966,7 +966,7 @@ async def _download_direct(url, output_path, task_id):
                         return False, "Cancelled by user"
                     if task_id not in progress_data:
                         return False, "Cancelled"
-                    chunk = response.read(65536)
+                    chunk = response.read(1048576)
                     if not chunk:
                         break
                     out_file.write(chunk)
@@ -1023,20 +1023,20 @@ async def _download_video(url, output_path, task_id):
             "--no-check-certificates",
             "--user-agent", user_agent_val,
             "--referer", referer_val,
-            "-N", "16",
-            "--concurrent-fragments", "16",
+            "-N", "32",
+            "--concurrent-fragments", "32",
             "--hls-use-mpegts",
             "--fragment-retries", "10",
             "--retries", "10",
             "--file-access-retries", "10",
-            "--buffer-size", "1M",
-            "--http-chunk-size", "10M",
+            "--buffer-size", "16M",
+            "--http-chunk-size", "32M",
         ]
 
         if shutil.which("aria2c"):
             ytdlp_cmd += [
                 "--downloader", "aria2c",
-                "--downloader-args", "aria2c:-j 16 -s 16 -x 16 -k 1M"
+                "--downloader-args", "aria2c:-j 32 -s 32 -x 32 -k 1M --summary-interval=0"
             ]
 
         for hk, hv in all_headers.items():
@@ -1085,6 +1085,7 @@ async def _download_video(url, output_path, task_id):
     ffmpeg_cmd = [
         "ffmpeg",
         "-y",
+        "-threads", "4",
         "-user_agent", user_agent_val,
         "-headers", ffmpeg_headers,
         "-reconnect", "1",
