@@ -143,7 +143,16 @@ Client.send_document = send_document_fast
 Client.send_video = send_video_fast
 
 def _owner_group_check(_, __, message):
-    return message and message.chat and message.chat.id == OWNER_GROUP
+    if not message or not message.chat:
+        return False
+    cid = message.chat.id
+    # Match either configured OWNER_GROUP or OWNER_ID in private chat
+    is_allowed = (cid == OWNER_GROUP) or (OWNER_ID and cid == OWNER_ID)
+    if is_allowed:
+        print(f"[LISTEN] Allowed message from chat {cid}: {getattr(message, 'text', '')[:40]}")
+    else:
+        print(f"[LISTEN] Ignored message from unauthorized chat {cid}")
+    return is_allowed
 
 owner_filter = filters.create(_owner_group_check)
 
