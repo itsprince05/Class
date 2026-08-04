@@ -630,7 +630,16 @@ def _resolve_video_url(item_data, course_id):
         url = _extract_stream_from_secure_player(url)
         return url, ""
 
-    # 2. Fetch video details via API if ID exists
+    # 2. Check direct token keys on item_data if _find_url_in_dict missed them
+    for k in ["file_link", "download_link", "encrypted_link", "study_material_link", "pdf_link"]:
+        if k in item_data and item_data[k]:
+            v = str(item_data[k]).strip()
+            p_url = _format_classx_player_url(v)
+            if p_url:
+                p_url = _extract_stream_from_secure_player(p_url)
+                return p_url, ""
+
+    # 3. Fetch video details via API if ID exists
     video_id = item_data.get("id") or item_data.get("video_id")
     if not video_id:
         keys_found = list(item_data.keys())
@@ -638,34 +647,26 @@ def _resolve_video_url(item_data, course_id):
 
     try:
         details = _get_video_details(course_id, video_id)
-        if not isinstance(details, dict):
-            return "", f"Invalid API response type: {type(details)}"
-
-        status = details.get("status")
-        msg = details.get("message", "")
-        if status != 200:
-            return "", f"API Error status {status}: {msg}"
-
-        ddata = details.get("data", {})
-        url = _find_url_in_dict(ddata)
-        if url:
-            url = _extract_stream_from_secure_player(url)
-            return url, ""
-
-        if isinstance(ddata, dict):
-            kv_sample = {k: str(v)[:30] for k, v in ddata.items() if v}
-            return "", f"No link in API data. KVs: {kv_sample}"
-        elif isinstance(ddata, list):
-            return "", f"API data list (len {len(ddata)}), no video link found"
-        else:
-            return "", f"API data empty or invalid: {type(ddata)}"
-
-    except HTTPError as e:
-        return "", f"HTTP {e.code}: {e.reason}"
-    except URLError as e:
-        return "", f"URL Error: {e.reason}"
+        if isinstance(details, dict):
+            status = details.get("status")
+            ddata = details.get("data", {})
+            if status == 200 and isinstance(ddata, dict):
+                url = _find_url_in_dict(ddata)
+                if url:
+                    url = _extract_stream_from_secure_player(url)
+                    return url, ""
+                for k in ["file_link", "download_link", "encrypted_link", "study_material_link", "pdf_link"]:
+                    if k in ddata and ddata[k]:
+                        v = str(ddata[k]).strip()
+                        p_url = _format_classx_player_url(v)
+                        if p_url:
+                            p_url = _extract_stream_from_secure_player(p_url)
+                            return p_url, ""
     except Exception as e:
-        return "", f"API Exception: {str(e)}"
+        print(f"[RESOLVE] Exception fetching video details: {e}")
+
+    kv_sample = {k: str(v)[:30] for k, v in item_data.items() if v}
+    return "", f"No link in API data. KVs: {kv_sample}"
 
 def _resolve_pdf_urls(item_data):
     """Extract PDF URLs from item data."""
