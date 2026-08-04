@@ -36,11 +36,13 @@ def _ensure_deps():
         print("  Ubuntu/Debian: sudo apt install ffmpeg")
         print("  CentOS/RHEL:   sudo yum install ffmpeg")
 
-    if not shutil.which("yt-dlp"):
-        print("[SETUP] Installing yt-dlp via pip...")
+    print("[SETUP] Ensuring yt-dlp is up-to-date...")
+    try:
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet", "yt-dlp"]
+            [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", "yt-dlp"]
         )
+    except Exception as e:
+        print(f"[SETUP] yt-dlp check warning: {e}")
 
 _ensure_deps()
 
@@ -310,6 +312,61 @@ def _get_video_details(course_id, video_id):
            f"?course_id={course_id}&folder_wise_course=1&ytflag=0&video_id={video_id}")
     return _api_get(url)
 
+def _decrypt_classx_url(encrypted_str):
+    """Decrypt ClassX encrypted video link if encrypted."""
+    if not encrypted_str:
+        return ""
+    if encrypted_str.startswith("http"):
+        return encrypted_str
+    try:
+        key = b"6385731993184651"
+        iv = b"6385731993184651"
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        decrypted = cipher.decrypt(base64.b64decode(encrypted_str))
+        decrypted = unpad(decrypted, AES.block_size).decode("utf-8")
+        if decrypted.startswith("http"):
+            return decrypted
+    except Exception:
+        pass
+    return ""
+
+def _resolve_video_url(item_data, course_id):
+    """Extract or fetch video URL for a given item."""
+    # 1. Check direct fields on item
+    for field in ["download_link", "video_link", "link", "url", "hls_url", "m3u8_url"]:
+        val = item_data.get(field, "")
+        if val and val.startswith("http"):
+            return val
+        if val:
+            dec = _decrypt_classx_url(val)
+            if dec:
+                return dec
+
+    # 2. Fetch video details via API if ID exists
+    video_id = item_data.get("id") or item_data.get("video_id")
+    if not video_id:
+        return ""
+
+    try:
+        details = _get_video_details(course_id, video_id)
+        if details.get("status") == 200:
+            ddata = details.get("data", {})
+            if isinstance(ddata, list) and ddata:
+                ddata = ddata[0]
+            if isinstance(ddata, dict):
+                for field in ["download_link", "video_link", "link", "url", "hls_url", "encrypted_link", "encrypted_link_360"]:
+                    val = ddata.get(field, "")
+                    if val and val.startswith("http"):
+                        return val
+                    if val:
+                        dec = _decrypt_classx_url(val)
+                        if dec:
+                            return dec
+    except Exception as e:
+        print(f"[BATCH] Error fetching video details for ID {video_id}: {e}")
+
+    return ""
+
 def _resolve_pdf_urls(item_data):
     """Extract PDF URLs from item data."""
     pdfs = []
@@ -517,8 +574,22 @@ async def _download_video(url, output_path, task_id):
             "yt-dlp",
             "--no-warnings",
             "--no-check-certificates",
-            "-N", "50",
+            "-N", "16",
+            "--concurrent-fragments", "16",
+            "--hls-use-mpegts",
+            "--fragment-retries", "10",
+            "--retries", "10",
+            "--file-access-retries", "10",
+            "--buffer-size", "1M",
+            "--http-chunk-size", "10M",
         ]
+
+        if shutil.which("aria2c"):
+            ytdlp_cmd += [
+                "--downloader", "aria2c",
+                "--downloader-args", "aria2c:-j 16 -s 16 -x 16 -k 1M"
+            ]
+
         for hk, hv in all_headers.items():
             ytdlp_cmd += ["--add-header", f"{hk}: {hv}"]
         ytdlp_cmd += ["-o", output_path, url]
@@ -560,6 +631,10 @@ async def _download_video(url, output_path, task_id):
     ffmpeg_cmd = [
         "ffmpeg",
         "-y",
+        "-reconnect", "1",
+        "-reconnect_at_eof", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
         "-headers", ffmpeg_headers,
         "-i", url,
         "-c", "copy",
@@ -842,6 +917,77 @@ async def handle_batch(client, message):
                 try:
                     if os.path.exists(pdf_path):
                         os.remove(pdf_path)
+                except OSError:
+                    pass
+
+        # --- Handle Videos ---
+        is_video_item = (material_type == "VIDEO") or bool(item.get("video_id")) or (not pdf_urls and material_type != "PDF")
+        if is_video_item:
+            video_url = await asyncio.to_thread(_resolve_video_url, item, course_id)
+            if not video_url:
+                print(f"[BATCH] No video URL found for item {item_id}: {title}")
+                if not pdf_urls:
+                    fail_count += 1
+                continue
+
+            try:
+                vid_label = f"{title}"
+                task_id = f"batch_vid_{item_id}_{int(time.time())}"
+                vid_filename = f"{vid_label}.mp4".replace("/", "-").replace("\\", "-").replace(":", "-").replace("*", "")
+                vid_path = str(DOWNLOAD_DIR / vid_filename)
+
+                progress_data[task_id] = {
+                    "phase": f"Downloading Video...\n{vid_label}",
+                    "current": 0,
+                    "total": 0,
+                }
+
+                updater = asyncio.create_task(_progress_loop(status_msg, task_id))
+                success, err = await _download_video(video_url, vid_path, task_id)
+
+                if not success or not os.path.exists(vid_path) or os.path.getsize(vid_path) == 0:
+                    progress_data.pop(task_id, None)
+                    updater.cancel()
+                    fail_count += 1
+                    try:
+                        await status_msg.edit_text(f"Video download failed for {vid_label}:\n{err[:300]}")
+                        await asyncio.sleep(3)
+                    except Exception:
+                        pass
+                    continue
+
+                file_size = os.path.getsize(vid_path)
+                progress_data[task_id] = {
+                    "phase": f"Uploading Video...\n{vid_label}",
+                    "current": 0,
+                    "total": file_size,
+                }
+
+                await client.send_video(
+                    chat_id=message.chat.id,
+                    video=vid_path,
+                    file_name=vid_filename,
+                    caption=vid_label,
+                    supports_streaming=True,
+                    progress=_upload_progress,
+                    progress_args=(task_id,),
+                )
+
+                progress_data.pop(task_id, None)
+                updater.cancel()
+                success_count += 1
+
+            except Exception as e:
+                fail_count += 1
+                try:
+                    await status_msg.edit_text(f"Error processing video {vid_label}:\n{e}")
+                    await asyncio.sleep(3)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    if os.path.exists(vid_path):
+                        os.remove(vid_path)
                 except OSError:
                     pass
 
