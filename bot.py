@@ -3,12 +3,7 @@ import sys
 import shutil
 import subprocess
 
-# ---------------------------------------------------------------------------
-# Auto-install missing dependencies
-# ---------------------------------------------------------------------------
-
 def _ensure_deps():
-    """Install missing Python packages and update yt-dlp at startup."""
     packages = {
         "pyrogram": "pyrogram",
         "tgcrypto": "tgcrypto",
@@ -36,10 +31,6 @@ def _ensure_deps():
 
 _ensure_deps()
 
-# ---------------------------------------------------------------------------
-# Core Imports
-# ---------------------------------------------------------------------------
-
 import asyncio
 import re
 import time
@@ -58,14 +49,10 @@ from pyrogram.types import (
 )
 from pyrogram.errors import FloodWait
 from pyrogram.raw.types import InputFileBig, InputFile
-from pyrogram.raw.functions.upload import SaveBigFilePart
+from pyrogram.raw.functions.upload import SaveBigFilePart, SaveFilePart
 from dotenv import load_dotenv
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
-
-# ---------------------------------------------------------------------------
-# Global State Tracking
-# ---------------------------------------------------------------------------
 
 cancelled_tasks = set()
 active_processes = {}
@@ -73,7 +60,6 @@ user_states = {}
 progress_data = {}
 
 def _cleanup_stale_user_states():
-    """Prune user states older than 15 minutes to prevent RAM leak from abandoned setups."""
     now = time.time()
     stale_users = [
         u for u, s in user_states.items()
@@ -81,10 +67,6 @@ def _cleanup_stale_user_states():
     ]
     for u in stale_users:
         user_states.pop(u, None)
-
-# ---------------------------------------------------------------------------
-# Configuration & Setup
-# ---------------------------------------------------------------------------
 
 load_dotenv()
 
@@ -115,12 +97,12 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     workdir=str(BASE_DIR),
+    max_concurrent_transmissions=16,
 )
 
 from urllib.parse import urlparse, unquote
 
 def extract_name_from_url(url: str, default_index: int = 1) -> str:
-    """Extract a clean title from a URL path or default to a clean lesson name."""
     try:
         url = decrypt_classx_url(url)
         path = urlparse(url).path
@@ -128,31 +110,23 @@ def extract_name_from_url(url: str, default_index: int = 1) -> str:
         if filename:
             clean_name = re.sub(r'\.(pdf|m3u8|mp4|ts|mkv|webm)$', '', filename, flags=re.IGNORECASE)
             clean_name = unquote(clean_name).replace('_', ' ').replace('-', ' ').strip()
-            # Ignore generic technical terms or random master/index names
             if clean_name and len(clean_name) > 3 and clean_name.lower() not in ["master", "index", "playlist", "video", "file"]:
                 return clean_name
     except Exception:
         pass
     return f"Lesson {default_index}"
 
-# ---------------------------------------------------------------------------
-# Helper Utility Functions
-# ---------------------------------------------------------------------------
-
 def is_pdf_url(url: str) -> bool:
-    """Check if URL points to a PDF document."""
     url_lower = url.lower()
     return ".pdf" in url_lower or "pdf" in url_lower
 
 def clean_b64(s: str) -> str:
-    """Fix base64 string padding."""
     if not s:
         return ""
     s = str(s).replace("\\/", "/").replace("\\", "").strip()
     return s + "=" * ((4 - len(s) % 4) % 4)
 
 def decrypt_classx_url(encrypted_str: str) -> str:
-    """Decrypt ClassX or encrypted stream/PDF links."""
     if not encrypted_str or not isinstance(encrypted_str, str):
         return ""
     encrypted_str = encrypted_str.strip()
@@ -178,7 +152,6 @@ def decrypt_classx_url(encrypted_str: str) -> str:
     return encrypted_str
 
 def format_bytes(size: int) -> str:
-    """Format size in bytes to human readable string with 2 decimal places."""
     if size <= 0:
         return "0.00 B"
     units = ["B", "KB", "MB", "GB", "TB"]
@@ -188,7 +161,6 @@ def format_bytes(size: int) -> str:
     return f"{s:.2f} {units[i]}"
 
 def get_readable_time(seconds: int) -> str:
-    """Format seconds into HH:MM:SS string."""
     if seconds <= 0:
         return "0s"
     m, s = divmod(seconds, 60)
@@ -199,12 +171,7 @@ def get_readable_time(seconds: int) -> str:
         return f"{m}m {s}s"
     return f"{s}s"
 
-# ---------------------------------------------------------------------------
-# Progress Loop Updater
-# ---------------------------------------------------------------------------
-
 async def _progress_loop(status_msg: Message, task_id: str, title: str = "", is_pdf: bool = False):
-    """Background task updating message progress in real-time with custom layout."""
     start_time = time.time()
     last_update = 0
     
@@ -256,12 +223,7 @@ async def _progress_loop(status_msg: Message, task_id: str, title: str = "", is_
             except Exception:
                 pass
 
-# ---------------------------------------------------------------------------
-# Downloaders (PDF & Video)
-# ---------------------------------------------------------------------------
-
 async def download_pdf(url: str, output_path: str, task_id: str) -> Tuple[bool, str]:
-    """Download direct PDF file."""
     try:
         url = decrypt_classx_url(url)
         req = Request(url, headers=HEADERS)
@@ -286,7 +248,6 @@ async def download_pdf(url: str, output_path: str, task_id: str) -> Tuple[bool, 
         return False, str(e)
 
 async def download_video(url: str, output_path: str, task_id: str, quality: str = "720") -> Tuple[bool, str]:
-    """Download video stream using yt-dlp with real-time disk monitoring."""
     disk_monitor = None
     try:
         url = decrypt_classx_url(url)
@@ -319,9 +280,8 @@ async def download_video(url: str, output_path: str, task_id: str, quality: str 
         active_processes[task_id] = process
         progress_data[task_id] = {"phase": "Downloading", "current": 0, "total": 0}
         
-        output_logs = deque(maxlen=50)  # Fixed size buffer to prevent memory leak from unconstrained log growth
+        output_logs = deque(maxlen=50)
 
-        # Real-time disk size monitor fallback
         async def monitor_disk_size():
             out_file = Path(output_path)
             parent_dir = out_file.parent
@@ -364,7 +324,6 @@ async def download_video(url: str, output_path: str, task_id: str, quality: str 
             if line_str:
                 output_logs.append(line_str)
             
-            # Parse yt-dlp percentage lines with --newline
             match = re.search(r'\[download\]\s+(\d+\.?\d*)%\s+of\s+~?\s*(\d+\.?\d*)(\w+)', line_str)
             if match:
                 pct = float(match.group(1))
@@ -391,12 +350,7 @@ async def download_video(url: str, output_path: str, task_id: str, quality: str 
         if disk_monitor and not disk_monitor.done():
             disk_monitor.cancel()
 
-# ---------------------------------------------------------------------------
-# Video Metadata & Thumbnail Generators
-# ---------------------------------------------------------------------------
-
 def get_video_metadata(filepath: str) -> Tuple[int, int, int]:
-    """Extract duration, width, height using ffprobe."""
     duration, width, height = 0, 0, 0
     try:
         cmd = [
@@ -426,7 +380,6 @@ def get_video_metadata(filepath: str) -> Tuple[int, int, int]:
     return duration, width, height
 
 def generate_thumbnail(video_path: str, thumb_path: str) -> str:
-    """Generate thumbnail image from video."""
     try:
         cmd = [
             "ffmpeg", "-y", "-ss", "00:00:02",
@@ -440,13 +393,8 @@ def generate_thumbnail(video_path: str, thumb_path: str) -> str:
         pass
     return ""
 
-# ---------------------------------------------------------------------------
-# Command Handlers (/start, /update, /upate, /stop, /cancel)
-# ---------------------------------------------------------------------------
-
 @app.on_message(filters.command("start"))
 async def start_cmd(client: Client, message: Message):
-    """Start command handler."""
     _cleanup_stale_user_states()
     user = message.from_user
     mention = user.mention if user else "User"
@@ -474,7 +422,6 @@ async def start_cmd(client: Client, message: Message):
 
 @app.on_message(filters.command("update"))
 async def update_cmd(client: Client, message: Message):
-    """Update command handler to pull code, upgrade yt-dlp, and restart."""
     _cleanup_stale_user_states()
     if OWNER_ID and message.from_user.id != OWNER_ID:
         await message.reply_text("Only the bot owner can execute /update command.")
@@ -498,15 +445,12 @@ async def update_cmd(client: Client, message: Message):
         
     await msg.edit_text("Update complete! Restarting process...")
     
-    # Save notification state
     RESTART_FILE.write_text(json.dumps({"chat_id": message.chat.id, "time": time.time()}))
     
-    # Restart python script
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 @app.on_message(filters.command("stop"))
 async def cancel_cmd(client: Client, message: Message):
-    """Cancel ongoing download tasks."""
     _cleanup_stale_user_states()
     user_id = message.from_user.id
     if user_id in user_states:
@@ -528,10 +472,6 @@ async def cancel_cmd(client: Client, message: Message):
         await message.reply_text("Stopped active download task!")
     else:
         await message.reply_text("No active task running.")
-
-# ---------------------------------------------------------------------------
-# Callback Query Handler
-# ---------------------------------------------------------------------------
 
 @app.on_callback_query()
 async def callback_handler(client: Client, query: CallbackQuery):
@@ -609,14 +549,6 @@ async def callback_handler(client: Client, query: CallbackQuery):
             await query.message.delete()
             asyncio.create_task(run_batch_download(client, query.message, state))
 
-# ---------------------------------------------------------------------------
-# Message Handlers (Documents / TXT & Links)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Message Handlers (Direct Link & Caption Edit)
-# ---------------------------------------------------------------------------
-
 @app.on_message(filters.document)
 async def document_handler(client: Client, message: Message):
     await message.reply_text("Please send a direct PDF or Video URL in chat.")
@@ -625,7 +557,6 @@ async def document_handler(client: Client, message: Message):
 async def text_handler(client: Client, message: Message):
     text = message.text.strip()
     
-    # 0. Reply Handler: Edit Caption of Video or PDF message sent by bot
     if message.reply_to_message:
         replied_msg = message.reply_to_message
         if replied_msg.from_user and replied_msg.from_user.is_self:
@@ -642,7 +573,6 @@ async def text_handler(client: Client, message: Message):
                     await message.reply_text(f"Failed to update caption: {e}")
                     return
 
-    # 1. Single Direct Link Input
     if ":" in text and not text.startswith("http"):
         parts = text.split(":", 1)
         name = parts[0].strip()
@@ -657,12 +587,96 @@ async def text_handler(client: Client, message: Message):
     else:
         await message.reply_text("Please send a valid PDF or Video URL.")
 
-# ---------------------------------------------------------------------------
-# Processing Engine (PDF & Video Download & Upload)
-# ---------------------------------------------------------------------------
+async def fast_upload_file(client: Client, filepath: str, task_id: str, progress_callback=None) -> Union[InputFileBig, InputFile]:
+    file_size = os.path.getsize(filepath)
+    is_big = file_size > 10 * 1024 * 1024
+    part_size = 512 * 1024
+    total_parts = math.ceil(file_size / part_size)
+    file_id = random.randint(1, 1 << 63)
+    filename = Path(filepath).name
+
+    uploaded_bytes = 0
+    progress_lock = asyncio.Lock()
+    parts_queue = asyncio.Queue()
+    
+    for part_index in range(total_parts):
+        parts_queue.put_nowait(part_index)
+
+    file_lock = asyncio.Lock()
+    file_obj = open(filepath, "rb")
+
+    async def read_chunk(part_index):
+        async with file_lock:
+            file_obj.seek(part_index * part_size)
+            return file_obj.read(part_size)
+
+    async def worker():
+        nonlocal uploaded_bytes
+        while not parts_queue.empty():
+            if task_id in cancelled_tasks:
+                break
+            try:
+                part_index = parts_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            chunk = await read_chunk(part_index)
+            if not chunk:
+                parts_queue.task_done()
+                continue
+
+            if is_big:
+                rpc = SaveBigFilePart(
+                    file_id=file_id,
+                    file_part=part_index,
+                    file_total_parts=total_parts,
+                    bytes=chunk
+                )
+            else:
+                rpc = SaveFilePart(
+                    file_id=file_id,
+                    file_part=part_index,
+                    bytes=chunk
+                )
+
+            success = False
+            for attempt in range(5):
+                if task_id in cancelled_tasks:
+                    break
+                try:
+                    await client.invoke(rpc)
+                    success = True
+                    break
+                except FloodWait as e:
+                    await asyncio.sleep(e.value)
+                except Exception:
+                    await asyncio.sleep(1)
+
+            if not success:
+                parts_queue.task_done()
+                raise Exception(f"Failed to upload part {part_index}")
+
+            async with progress_lock:
+                uploaded_bytes += len(chunk)
+                if progress_callback:
+                    await progress_callback(uploaded_bytes, file_size, task_id)
+            parts_queue.task_done()
+
+    try:
+        workers = [asyncio.create_task(worker()) for _ in range(12)]
+        await asyncio.gather(*workers)
+    finally:
+        file_obj.close()
+
+    if task_id in cancelled_tasks:
+        raise Exception("Upload cancelled by user")
+
+    if is_big:
+        return InputFileBig(id=file_id, parts=total_parts, name=filename)
+    else:
+        return InputFile(id=file_id, parts=total_parts, name=filename, md5_checksum="")
 
 async def process_single_item(client: Client, chat_id: int, item: Dict[str, Any], quality: str = "720"):
-    """Process a single PDF or Video link item."""
     name = item.get("name", "File")
     raw_url = item.get("url", "")
     url = decrypt_classx_url(raw_url)
@@ -701,32 +715,30 @@ async def process_single_item(client: Client, chat_id: int, item: Dict[str, Any]
                 progress_data[t_id]["total"] = total
                 
         if is_pdf:
+            uploaded_file = await fast_upload_file(client, output_path, task_id, progress_callback=upload_prog)
             await client.send_document(
                 chat_id=chat_id,
-                document=output_path,
+                document=uploaded_file,
                 file_name=filename,
-                caption=f"{name}",
-                progress=upload_prog,
-                progress_args=(task_id,)
+                caption=f"{name}"
             )
         else:
             duration, width, height = await asyncio.to_thread(get_video_metadata, output_path)
             thumb_file = str(DOWNLOAD_DIR / f"thumb_{task_id}.jpg")
             thumb = await asyncio.to_thread(generate_thumbnail, output_path, thumb_file)
             
+            uploaded_file = await fast_upload_file(client, output_path, task_id, progress_callback=upload_prog)
             try:
                 await client.send_video(
                     chat_id=chat_id,
-                    video=output_path,
+                    video=uploaded_file,
                     file_name=filename,
                     duration=duration,
                     width=width,
                     height=height,
                     thumb=thumb if thumb and os.path.exists(thumb) else None,
                     caption=f"{name} [{quality}p]",
-                    supports_streaming=True,
-                    progress=upload_prog,
-                    progress_args=(task_id,)
+                    supports_streaming=True
                 )
             finally:
                 if thumb and os.path.exists(thumb):
@@ -748,7 +760,6 @@ async def process_single_item(client: Client, chat_id: int, item: Dict[str, Any]
         if updater and not updater.done():
             updater.cancel()
             
-        # Clean up all matching download files (including .part, .ytdl, .jpg)
         try:
             for p in DOWNLOAD_DIR.glob(f"{task_id}*"):
                 if p.exists():
@@ -758,31 +769,6 @@ async def process_single_item(client: Client, chat_id: int, item: Dict[str, Any]
                         pass
         except Exception:
             pass
-
-# ---------------------------------------------------------------------------
-# Restart Notification & Entry Point
-# ---------------------------------------------------------------------------
-
-@app.on_message(group=-1)
-async def check_restart_notification(client: Client, message: Message):
-    if RESTART_FILE.exists():
-        try:
-            RESTART_FILE.unlink()
-        except Exception as e:
-            print(f"[RESTART] Notification error: {e}")
-    message.continue_propagation()
-
-if __name__ == "__main__":
-    if not BOT_TOKEN or not API_ID or not API_HASH:
-        print("ERROR: BOT_TOKEN, API_ID, or API_HASH missing from .env")
-        sys.exit(1)
-
-    print("Bot started successfully. Listening for commands...")
-    app.run()
-
-# ---------------------------------------------------------------------------
-# Restart Notification & Entry Point
-# ---------------------------------------------------------------------------
 
 @app.on_message(group=-1)
 async def check_restart_notification(client: Client, message: Message):
